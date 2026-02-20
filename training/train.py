@@ -79,6 +79,11 @@ def train(
     seed: int = 42,
     val_samples: int = 256,
     val_seed: int = 1337,
+    train_min_len: int = 2,
+    train_max_len: int = 32,
+    val_min_len: int = 2,
+    val_max_len: int = 40,
+    curriculum: bool = True,
 ) -> None:
     """Train the MicroOCR model.
 
@@ -91,9 +96,22 @@ def train(
         seed: Random seed.
         val_samples: Number of synthetic eval samples.
         val_seed: RNG seed for deterministic eval set.
+        train_min_len: Minimum synthetic label length during training.
+        train_max_len: Maximum synthetic label length during training.
+        val_min_len: Minimum synthetic label length for validation.
+        val_max_len: Maximum synthetic label length for validation.
+        curriculum: If True, use curriculum learning — start with shorter/
+            easier text and progressively increase max label length and
+            font-size range over epochs.
     """
     if val_samples < 1:
         raise ValueError("val_samples must be >= 1")
+    if train_min_len < 1 or val_min_len < 1:
+        raise ValueError("min lengths must be >= 1")
+    if train_max_len < train_min_len:
+        raise ValueError("train_max_len must be >= train_min_len")
+    if val_max_len < val_min_len:
+        raise ValueError("val_max_len must be >= val_min_len")
 
     rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,8 +138,16 @@ def train(
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    eval_images, eval_labels = build_eval_set(num_samples=val_samples, seed=val_seed)
-    print(f"Validation set: {val_samples} synthetic samples (seed={val_seed})")
+    eval_images, eval_labels = build_eval_set(
+        num_samples=val_samples,
+        seed=val_seed,
+        min_len=val_min_len,
+        max_len=val_max_len,
+    )
+    print(
+        f"Validation set: {val_samples} synthetic samples (seed={val_seed}, "
+        f"len={val_min_len}-{val_max_len})"
+    )
 
     best_val_cer = float("inf")
     best_val_word_acc = 0.0
@@ -129,14 +155,43 @@ def train(
     # Entropy regularization weight
     entropy_weight = 0.01
 
+    # Curriculum learning parameters
+    cur_start_max_len = max(train_min_len + 2, train_max_len // 3)
+    # Font size: start with a narrow mid-range, expand to full range over time
+    full_font_min, full_font_max = 20, 40
+
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_start = time.time()
 
+        # Curriculum: linearly ramp difficulty from easy to full over epochs
+        if curriculum and epochs > 1:
+            progress = (epoch - 1) / (epochs - 1)  # 0.0 -> 1.0
+            cur_max_len = int(
+                cur_start_max_len + progress * (train_max_len - cur_start_max_len)
+            )
+            cur_max_len = max(cur_max_len, train_min_len + 1)
+            # Narrow font range early, full range later
+            cur_font_min = int(full_font_min + (1 - progress) * 4)  # 24 -> 20
+            cur_font_max = int(full_font_max - (1 - progress) * 6)  # 34 -> 40
+            cur_font_range = (cur_font_min, max(cur_font_max, cur_font_min + 4))
+        else:
+            cur_max_len = train_max_len
+            cur_font_range = (full_font_min, full_font_max)
+
+        if curriculum:
+            print(f"  [curriculum] max_len={cur_max_len}, font_range={cur_font_range}")
+
         for batch_idx in range(1, batches_per_epoch + 1):
             # Generate synthetic batch
-            images, labels = generate_batch(batch_size, rng=rng)
+            images, labels = generate_batch(
+                batch_size,
+                rng=rng,
+                min_len=train_min_len,
+                max_len=cur_max_len,
+                font_size_range=cur_font_range,
+            )
 
             # Collate
             batch_imgs, targets, input_lens, target_lens = collate_batch(images, labels)
@@ -361,6 +416,25 @@ def main():
         action="store_true",
         help="Export INT8 quantized weights",
     )
+    parser.add_argument(
+        "--train-min-len", type=int, default=2, help="Training min label length"
+    )
+    parser.add_argument(
+        "--train-max-len", type=int, default=32, help="Training max label length"
+    )
+    parser.add_argument(
+        "--val-min-len", type=int, default=2, help="Validation min label length"
+    )
+    parser.add_argument(
+        "--val-max-len", type=int, default=40, help="Validation max label length"
+    )
+    parser.add_argument(
+        "--curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable curriculum learning (easy-to-hard progression). "
+        "Use --no-curriculum to disable.",
+    )
     args = parser.parse_args()
 
     train(
@@ -372,6 +446,11 @@ def main():
         seed=args.seed,
         val_samples=args.val_samples,
         val_seed=args.val_seed,
+        train_min_len=args.train_min_len,
+        train_max_len=args.train_max_len,
+        val_min_len=args.val_min_len,
+        val_max_len=args.val_max_len,
+        curriculum=args.curriculum,
     )
 
 

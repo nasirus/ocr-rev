@@ -10,6 +10,10 @@ model robustness with lightweight perturbations:
 - random erasing / cutout
 - salt-and-pepper noise
 - elastic distortion
+- paper texture and stains (document realism)
+- horizontal line artifacts (underlines, strikethroughs, scan lines)
+- scanner border shadows
+- variable background textures (Perlin-style noise)
 """
 
 from __future__ import annotations
@@ -37,7 +41,20 @@ def augment(img: np.ndarray, rng: np.random.Generator | None = None) -> np.ndarr
     if rng is None:
         rng = np.random.default_rng()
 
-    # Apply each augmentation with some probability.
+    # ── Document-realism augmentations (applied early) ────────────────
+    if rng.random() < 0.20:
+        img = paper_texture(img, rng)
+
+    if rng.random() < 0.12:
+        img = add_stains(img, rng)
+
+    if rng.random() < 0.15:
+        img = scanner_shadow(img, rng)
+
+    if rng.random() < 0.15:
+        img = line_artifact(img, rng)
+
+    # ── Standard augmentations ────────────────────────────────────────
     if rng.random() < 0.6:
         img = add_gaussian_noise(img, rng, sigma_range=(0.01, 0.08))
 
@@ -78,6 +95,9 @@ def augment(img: np.ndarray, rng: np.random.Generator | None = None) -> np.ndarr
         img = elastic_distortion(img, rng, alpha=3.0, sigma=0.5)
 
     return np.clip(img, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+# ── Standard augmentations ────────────────────────────────────────────
 
 
 def add_gaussian_noise(
@@ -192,7 +212,9 @@ def random_rotate(
     if Image is None:
         return img
     angle = float(rng.uniform(-max_degrees, max_degrees))
-    resample = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    resample = (
+        Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    )
     pil = Image.fromarray((np.clip(img, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
     out = pil.rotate(angle, resample=resample, fillcolor=255)
     return np.array(out, dtype=np.float32) / 255.0
@@ -232,7 +254,9 @@ def random_perspective(
         dtype=np.float32,
     )
     coeffs = _find_perspective_coeffs(src, dst)
-    resample = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    resample = (
+        Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    )
 
     pil = Image.fromarray((np.clip(img, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
     warped = pil.transform(
@@ -372,6 +396,193 @@ def elastic_distortion(
         + img[y1, x1] * wx * wy
     )
     return out.astype(np.float32, copy=False)
+
+
+# ── Document-realism augmentations ────────────────────────────────────
+
+
+def paper_texture(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    strength_range: tuple[float, float] = (0.02, 0.08),
+) -> np.ndarray:
+    """Add subtle paper-like texture noise to simulate scanned paper grain.
+
+    Uses multi-scale noise to mimic the fibrous texture of real paper.
+    """
+    h, w = img.shape
+    strength = rng.uniform(*strength_range)
+
+    # Fine grain (pixel-level)
+    fine = rng.normal(0, 1, size=(h, w)).astype(np.float32)
+
+    # Coarse grain (downsampled then upscaled) — simulates paper fiber
+    coarse_h = max(2, h // 4)
+    coarse_w = max(2, w // 4)
+    coarse_small = rng.normal(0, 1, size=(coarse_h, coarse_w)).astype(np.float32)
+
+    # Nearest-neighbor upscale
+    row_idx = np.clip((np.arange(h) * coarse_h / h).astype(int), 0, coarse_h - 1)
+    col_idx = np.clip((np.arange(w) * coarse_w / w).astype(int), 0, coarse_w - 1)
+    coarse = coarse_small[np.ix_(row_idx, col_idx)]
+
+    # Blend fine + coarse
+    texture = 0.6 * fine + 0.4 * coarse
+    texture = texture * strength
+
+    return img + texture
+
+
+def add_stains(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    n_stains_range: tuple[int, int] = (1, 4),
+) -> np.ndarray:
+    """Add subtle circular stain marks that simulate coffee stains, aging spots.
+
+    Stains are light enough to not destroy text but add realism.
+    """
+    h, w = img.shape
+    out = img.copy()
+    n_stains = int(rng.integers(*n_stains_range))
+
+    for _ in range(n_stains):
+        # Random center
+        cy = int(rng.integers(0, h))
+        cx = int(rng.integers(0, w))
+
+        # Random radius (small relative to image)
+        max_radius = max(3, min(h, w) // 4)
+        radius = int(rng.integers(2, max_radius + 1))
+
+        # Intensity of the stain (darkening effect, subtle)
+        intensity = rng.uniform(-0.08, -0.02)
+
+        # Create circular mask with smooth falloff
+        yy, xx = np.ogrid[0:h, 0:w]
+        dist_sq = (yy - cy) ** 2 + (xx - cx) ** 2
+        radius_sq = radius * radius
+
+        # Smooth gaussian-like falloff
+        mask = np.exp(-dist_sq.astype(np.float32) / (2.0 * radius_sq))
+        out = out + mask * intensity
+
+    return out
+
+
+def scanner_shadow(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    shadow_width_range: tuple[float, float] = (0.05, 0.15),
+    shadow_strength_range: tuple[float, float] = (-0.12, -0.03),
+) -> np.ndarray:
+    """Add dark shadow bands along edges to simulate scanner artifacts.
+
+    Real scanners often produce dark shadows along the edges of the page,
+    especially near the spine of bound documents.
+    """
+    h, w = img.shape
+    out = img.copy()
+
+    # Pick 1-2 edges to shadow
+    edges = []
+    if rng.random() < 0.5:
+        edges.append("left")
+    if rng.random() < 0.5:
+        edges.append("right")
+    if rng.random() < 0.3:
+        edges.append("top")
+    if rng.random() < 0.3:
+        edges.append("bottom")
+
+    if not edges:
+        edges.append("left" if rng.random() < 0.5 else "right")
+
+    for edge in edges:
+        strength = rng.uniform(*shadow_strength_range)
+        rel_width = rng.uniform(*shadow_width_range)
+
+        if edge in ("left", "right"):
+            shadow_w = max(1, int(w * rel_width))
+            grad = np.linspace(strength, 0.0, shadow_w, dtype=np.float32)
+            if edge == "left":
+                out[:, :shadow_w] += grad[np.newaxis, :]
+            else:
+                out[:, -shadow_w:] += grad[np.newaxis, ::-1]
+        else:
+            shadow_h = max(1, int(h * rel_width))
+            grad = np.linspace(strength, 0.0, shadow_h, dtype=np.float32)
+            if edge == "top":
+                out[:shadow_h, :] += grad[:, np.newaxis]
+            else:
+                out[-shadow_h:, :] += grad[::-1, np.newaxis]
+
+    return out
+
+
+def line_artifact(
+    img: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Add horizontal line artifacts simulating underlines, strikethroughs,
+    scan lines, or fold creases.
+
+    These are common in real scanned documents:
+    - Underlines beneath text
+    - Strikethroughs across text
+    - Scanner feeder lines (thin horizontal streaks)
+    - Paper fold creases
+    """
+    h, w = img.shape
+    out = img.copy()
+
+    style = int(rng.integers(0, 4))
+
+    if style == 0:
+        # Underline: dark line near the bottom third
+        y = int(rng.integers(h * 2 // 3, h))
+        thickness = int(rng.integers(1, 3))
+        darkness = rng.uniform(0.0, 0.3)
+        y_end = min(h, y + thickness)
+        # Span most of the width
+        x_start = int(rng.integers(0, max(1, w // 8)))
+        x_end = w - int(rng.integers(0, max(1, w // 8)))
+        out[y:y_end, x_start:x_end] = darkness
+
+    elif style == 1:
+        # Strikethrough: line through the middle
+        y = int(rng.integers(h // 3, 2 * h // 3))
+        thickness = int(rng.integers(1, 3))
+        darkness = rng.uniform(0.0, 0.25)
+        y_end = min(h, y + thickness)
+        x_start = int(rng.integers(0, max(1, w // 6)))
+        x_end = w - int(rng.integers(0, max(1, w // 6)))
+        out[y:y_end, x_start:x_end] = darkness
+
+    elif style == 2:
+        # Scan line: thin faint horizontal streak across full width
+        n_lines = int(rng.integers(1, 4))
+        for _ in range(n_lines):
+            y = int(rng.integers(0, h))
+            faintness = rng.uniform(-0.08, -0.02)
+            out[y, :] += faintness
+
+    else:
+        # Fold crease: subtle brightness change across a horizontal band
+        y = int(rng.integers(h // 4, 3 * h // 4))
+        crease_h = int(rng.integers(1, max(2, h // 6)))
+        y_end = min(h, y + crease_h)
+        # Crease slightly darkens the band
+        crease_strength = rng.uniform(-0.06, -0.01)
+        grad = np.abs(np.linspace(-1, 1, crease_h, dtype=np.float32))
+        # V-shaped profile (darkest in center)
+        profile = (1.0 - grad) * crease_strength
+        out[y:y_end, :] += profile[:, np.newaxis]
+
+    return out
+
+
+# ── Helper functions ──────────────────────────────────────────────────
 
 
 def _box_filter_2d(img: np.ndarray, k: int) -> np.ndarray:

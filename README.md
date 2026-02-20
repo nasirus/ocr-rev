@@ -93,6 +93,12 @@ For training extras:
 uv sync --extra train
 ```
 
+To wait for running to finish:
+
+```bash
+PYTHONUNBUFFERED=1 /home/nasirus/ocr-rev/.venv/bin/python /home/nasirus/ocr-rev/run_training.py
+```
+
 For development/testing extras:
 
 ```bash

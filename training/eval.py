@@ -19,12 +19,16 @@ from training.synth_data import generate_batch
 def build_eval_set(
     num_samples: int = 256,
     seed: int = 1337,
+    min_len: int = 1,
+    max_len: int = 20,
 ) -> tuple[list[np.ndarray], list[str]]:
     """Build a deterministic synthetic eval set."""
     rng = np.random.default_rng(seed)
     return generate_batch(
         num_samples,
         rng=rng,
+        min_len=min_len,
+        max_len=max_len,
         apply_augment=False,
         align_with_inference=True,
     )
@@ -62,11 +66,18 @@ def evaluate_npz(
     npz_path: str | Path,
     num_samples: int = 256,
     seed: int = 1337,
+    min_len: int = 1,
+    max_len: int = 20,
 ) -> dict[str, float]:
     """Evaluate an exported NumPy checkpoint."""
     with np.load(str(npz_path)) as data:
         weights = {k: data[k] for k in data.files}
-    images, labels = build_eval_set(num_samples=num_samples, seed=seed)
+    images, labels = build_eval_set(
+        num_samples=num_samples,
+        seed=seed,
+        min_len=min_len,
+        max_len=max_len,
+    )
     return evaluate_arrays(weights, images, labels)
 
 
@@ -74,6 +85,8 @@ def evaluate_pth(
     pth_path: str | Path,
     num_samples: int = 256,
     seed: int = 1337,
+    min_len: int = 1,
+    max_len: int = 20,
 ) -> dict[str, float]:
     """Evaluate a PyTorch checkpoint by running NumPy inference.
 
@@ -89,7 +102,12 @@ def evaluate_pth(
     if any(k.startswith("bn") for k in weights):
         weights = _fold_bn_from_state_dict(weights)
 
-    images, labels = build_eval_set(num_samples=num_samples, seed=seed)
+    images, labels = build_eval_set(
+        num_samples=num_samples,
+        seed=seed,
+        min_len=min_len,
+        max_len=max_len,
+    )
     return evaluate_arrays(weights, images, labels)
 
 
@@ -145,13 +163,27 @@ def main() -> None:
     parser.add_argument("checkpoint", help="Path to .pth or .npz file")
     parser.add_argument("--samples", type=int, default=256, help="Eval set size")
     parser.add_argument("--seed", type=int, default=1337, help="Eval RNG seed")
+    parser.add_argument("--min-len", type=int, default=1, help="Minimum label length")
+    parser.add_argument("--max-len", type=int, default=20, help="Maximum label length")
     args = parser.parse_args()
 
     ckpt = Path(args.checkpoint)
     if ckpt.suffix == ".pth":
-        metrics = evaluate_pth(ckpt, num_samples=args.samples, seed=args.seed)
+        metrics = evaluate_pth(
+            ckpt,
+            num_samples=args.samples,
+            seed=args.seed,
+            min_len=args.min_len,
+            max_len=args.max_len,
+        )
     elif ckpt.suffix == ".npz":
-        metrics = evaluate_npz(ckpt, num_samples=args.samples, seed=args.seed)
+        metrics = evaluate_npz(
+            ckpt,
+            num_samples=args.samples,
+            seed=args.seed,
+            min_len=args.min_len,
+            max_len=args.max_len,
+        )
     else:
         raise ValueError("Checkpoint must be .pth or .npz")
 

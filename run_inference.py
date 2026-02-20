@@ -78,13 +78,23 @@ def main():
             return
 
         print(f"Running inference on: {path}")
-        result = microocr.read_file(str(path), weights_path=str(weights))
+        result = microocr.read_file(
+            str(path),
+            weights_path=str(weights),
+            decode_mode="beam",
+            beam_width=12,
+        )
         print(f"\nRecognized text:\n{result}")
     else:
         # Generate a test image and run
         b64, expected = generate_test_image()
         print(f"\nRunning inference...")
-        result = microocr.read(b64, weights_path=str(weights))
+        result = microocr.read(
+            b64,
+            weights_path=str(weights),
+            decode_mode="beam",
+            beam_width=12,
+        )
         print(f"\nRecognized text: '{result}'")
         print(f"Expected text:   '{expected}'")
         if result == expected:
