@@ -15,10 +15,16 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-# Character set: a-z (26) + A-Z (26) + 0-9 (10) + CTC blank
-CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-BLANK_IDX = len(CHARS)  # 62
-NUM_CLASSES = len(CHARS) + 1  # 63
+# Character set:
+#   - letters + digits
+#   - whitespace (space)
+#   - common special characters
+_ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_WHITESPACE = " "
+_SPECIAL = ".,:;!?@#$%&*+-_/()[]{}'\"=<>"
+CHARS = _ALNUM + _WHITESPACE + _SPECIAL
+BLANK_IDX = len(CHARS)
+NUM_CLASSES = len(CHARS) + 1
 
 
 def char_to_index(c: str) -> int:
@@ -42,7 +48,7 @@ class MicroOCRModel(nn.Module):
     """Tiny CNN + CTC recognition model.
 
     The network processes a (B, 1, 32, W) image and outputs
-    (T, B, 63) logits where T = W // 4 (due to two 2x2 max-pools).
+    (T, B, num_classes) logits where T = W // 4 (due to two 2x2 max-pools).
     """
 
     def __init__(self, num_classes: int = NUM_CLASSES):
@@ -52,12 +58,17 @@ class MicroOCRModel(nn.Module):
         # Feature extractor: 4 conv layers, 2 max-pools
         # Input: (B, 1, 32, W)
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)  # → (B,16,32,W)
+        self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)  # → (B,32,16,W/2)
+        self.bn2 = nn.BatchNorm2d(32)
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)  # → (B,64,8,W/4)
+        self.bn3 = nn.BatchNorm2d(64)
         self.conv4 = nn.Conv2d(64, 64, kernel_size=3, padding=1)  # → (B,64,8,W/4)
+        self.bn4 = nn.BatchNorm2d(64)
 
         self.pool = nn.MaxPool2d(2, 2)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(p=0.1)
 
         # After conv4: (B, 64, 8, W/4)
         # Collapse height: reshape to (B, W/4, 64*8) = (B, T, 512)
@@ -73,13 +84,14 @@ class MicroOCRModel(nn.Module):
         Returns:
             (T, B, num_classes) log-probabilities for CTC.
         """
-        # Conv block 1: conv → relu → pool
-        x = self.pool(self.relu(self.conv1(x)))  # (B,16,16,W/2)
-        # Conv block 2: conv → relu → pool
-        x = self.pool(self.relu(self.conv2(x)))  # (B,32,8,W/4)
-        # Conv blocks 3-4: conv → relu (no pool)
-        x = self.relu(self.conv3(x))  # (B,64,8,W/4)
-        x = self.relu(self.conv4(x))  # (B,64,8,W/4)
+        # Conv block 1: conv → BN → relu → pool
+        x = self.pool(self.relu(self.bn1(self.conv1(x))))  # (B,16,16,W/2)
+        # Conv block 2: conv → BN → relu → pool
+        x = self.pool(self.relu(self.bn2(self.conv2(x))))  # (B,32,8,W/4)
+        # Conv block 3: conv → BN → relu (no pool)
+        x3 = self.relu(self.bn3(self.conv3(x)))  # (B,64,8,W/4)
+        # Conv block 4: conv → BN → relu + residual from conv3
+        x = self.relu(self.bn4(self.conv4(x3)) + x3)  # (B,64,8,W/4)
 
         # Collapse spatial dims: (B, 64, 8, T) → (B, T, 64*8)
         b, c, h, w = x.size()
@@ -87,7 +99,7 @@ class MicroOCRModel(nn.Module):
         x = x.reshape(b, w, c * h)  # (B, T, 512)
 
         # Classifier
-        x = self.relu(self.fc1(x))  # (B, T, 128)
+        x = self.dropout(self.relu(self.fc1(x)))  # (B, T, 128)
         x = self.fc2(x)  # (B, T, num_classes)
 
         # CTC expects (T, B, C)

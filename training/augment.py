@@ -7,6 +7,9 @@ model robustness with lightweight perturbations:
 - brightness / contrast / illumination shifts
 - slight rotation and perspective warp
 - JPEG compression artifacts
+- random erasing / cutout
+- salt-and-pepper noise
+- elastic distortion
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ def augment(img: np.ndarray, rng: np.random.Generator | None = None) -> np.ndarr
         rng = np.random.default_rng()
 
     # Apply each augmentation with some probability.
-    if rng.random() < 0.5:
+    if rng.random() < 0.6:
         img = add_gaussian_noise(img, rng, sigma_range=(0.01, 0.08))
 
     if rng.random() < 0.3:
@@ -56,14 +59,23 @@ def augment(img: np.ndarray, rng: np.random.Generator | None = None) -> np.ndarr
     if rng.random() < 0.25:
         img = gamma_adjust(img, rng)
 
-    if Image is not None and rng.random() < 0.25:
+    if Image is not None and rng.random() < 0.35:
         img = random_rotate(img, rng, max_degrees=4.0)
 
-    if Image is not None and rng.random() < 0.2:
+    if Image is not None and rng.random() < 0.3:
         img = random_perspective(img, rng, max_warp_ratio=0.08)
 
     if Image is not None and rng.random() < 0.2:
         img = jpeg_compress(img, rng, quality_range=(35, 90))
+
+    if rng.random() < 0.3:
+        img = random_erasing(img, rng)
+
+    if rng.random() < 0.2:
+        img = salt_and_pepper(img, rng, amount=0.01)
+
+    if rng.random() < 0.2:
+        img = elastic_distortion(img, rng, alpha=3.0, sigma=0.5)
 
     return np.clip(img, 0.0, 1.0).astype(np.float32, copy=False)
 
@@ -249,6 +261,129 @@ def jpeg_compress(
     buf.seek(0)
     decoded = Image.open(buf).convert("L")
     return np.array(decoded, dtype=np.float32) / 255.0
+
+
+def random_erasing(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    area_range: tuple[float, float] = (0.02, 0.10),
+    fill: float | None = None,
+) -> np.ndarray:
+    """Random erasing / cutout augmentation.
+
+    Erases a small random rectangular region, filled with near-white.
+    """
+    h, w = img.shape
+    area = h * w
+    erase_area = rng.uniform(*area_range) * area
+    aspect_ratio = rng.uniform(0.3, 3.3)
+
+    eh = int(np.sqrt(erase_area * aspect_ratio))
+    ew = int(np.sqrt(erase_area / aspect_ratio))
+    eh = min(eh, h - 1)
+    ew = min(ew, w - 1)
+    if eh < 1 or ew < 1:
+        return img
+
+    y = int(rng.integers(0, h - eh))
+    x = int(rng.integers(0, w - ew))
+
+    out = img.copy()
+    if fill is None:
+        # Fill with near-white (0.9 - 1.0)
+        fill_val = rng.uniform(0.9, 1.0)
+    else:
+        fill_val = fill
+    out[y : y + eh, x : x + ew] = fill_val
+    return out
+
+
+def salt_and_pepper(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    amount: float = 0.01,
+) -> np.ndarray:
+    """Add salt-and-pepper noise."""
+    out = img.copy()
+    n_pixels = img.size
+    n_salt = int(amount * n_pixels / 2)
+    n_pepper = int(amount * n_pixels / 2)
+
+    # Salt (white)
+    if n_salt > 0:
+        coords = (
+            rng.integers(0, img.shape[0], size=n_salt),
+            rng.integers(0, img.shape[1], size=n_salt),
+        )
+        out[coords] = 1.0
+
+    # Pepper (black)
+    if n_pepper > 0:
+        coords = (
+            rng.integers(0, img.shape[0], size=n_pepper),
+            rng.integers(0, img.shape[1], size=n_pepper),
+        )
+        out[coords] = 0.0
+
+    return out
+
+
+def elastic_distortion(
+    img: np.ndarray,
+    rng: np.random.Generator,
+    alpha: float = 3.0,
+    sigma: float = 0.5,
+) -> np.ndarray:
+    """Apply elastic distortion with small displacement fields.
+
+    Uses random displacement fields smoothed by a simple box filter.
+    """
+    h, w = img.shape
+    if h < 4 or w < 4:
+        return img
+
+    # Generate random displacement fields
+    dx = rng.uniform(-1.0, 1.0, size=(h, w)).astype(np.float32)
+    dy = rng.uniform(-1.0, 1.0, size=(h, w)).astype(np.float32)
+
+    # Smooth with box filter (approximating Gaussian)
+    k = max(3, int(sigma * 6) | 1)  # ensure odd
+    dx = _box_filter_2d(dx, k) * alpha
+    dy = _box_filter_2d(dy, k) * alpha
+
+    # Create coordinate grids
+    y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+    map_x = np.clip(x_coords + dx, 0, w - 1)
+    map_y = np.clip(y_coords + dy, 0, h - 1)
+
+    # Bilinear interpolation
+    x0 = np.floor(map_x).astype(np.int32)
+    y0 = np.floor(map_y).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+
+    wx = map_x - x0
+    wy = map_y - y0
+
+    out = (
+        img[y0, x0] * (1 - wx) * (1 - wy)
+        + img[y0, x1] * wx * (1 - wy)
+        + img[y1, x0] * (1 - wx) * wy
+        + img[y1, x1] * wx * wy
+    )
+    return out.astype(np.float32, copy=False)
+
+
+def _box_filter_2d(img: np.ndarray, k: int) -> np.ndarray:
+    """Apply a box filter (mean filter) of size k."""
+    pad = k // 2
+    padded = np.pad(img, pad, mode="reflect")
+    h, w = img.shape
+    out = np.zeros_like(img)
+    for dy in range(k):
+        for dx in range(k):
+            out += padded[dy : dy + h, dx : dx + w]
+    return out / (k * k)
 
 
 def _find_perspective_coeffs(src: np.ndarray, dst: np.ndarray) -> np.ndarray:

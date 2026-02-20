@@ -19,6 +19,7 @@ import numpy as np
 
 from microocr.ctc import BLANK_IDX, beam_decode, greedy_decode
 from microocr.decode import decode_base64
+from microocr.model import NUM_CLASSES
 from microocr.preprocess import TARGET_HEIGHT, binarize, preprocess
 from microocr.segment import segment_lines
 
@@ -245,6 +246,7 @@ def _read_impl(
             low_confidence_beam_fallback=low_confidence_beam_fallback,
             fallback_margin=fallback_margin,
             beam_width=beam_width,
+            weights=weights,
         )
         _accum_ms(timings, "decode_ctc_ms", t)
 
@@ -275,18 +277,32 @@ def _decode_line(
     low_confidence_beam_fallback: bool,
     fallback_margin: float,
     beam_width: int,
+    weights: dict[str, np.ndarray] | None = None,
 ) -> str:
     if reject_blank:
         blank_ratio, nonblank_peak = _blank_line_stats(logits)
         if blank_ratio >= reject_blank_ratio and nonblank_peak < reject_nonblank_peak:
             return ""
 
+    # Extract bigram table from weights if present
+    bigram_log_probs = None
+    if weights is not None and "bigram_log_probs" in weights:
+        bigram_log_probs = weights["bigram_log_probs"]
+
     if decode_mode == "beam":
-        return beam_decode(logits, beam_width=beam_width)
+        return beam_decode(
+            logits,
+            beam_width=beam_width,
+            bigram_log_probs=bigram_log_probs,
+        )
 
     text = greedy_decode(logits)
     if low_confidence_beam_fallback and _mean_top1_margin(logits) < fallback_margin:
-        return beam_decode(logits, beam_width=beam_width)
+        return beam_decode(
+            logits,
+            beam_width=beam_width,
+            bigram_log_probs=bigram_log_probs,
+        )
     return text
 
 
@@ -334,7 +350,10 @@ def _downsample_width(img: np.ndarray, target_width: int) -> np.ndarray:
 
 
 def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
-    """Load model weights from a .npz file, with caching."""
+    """Load model weights from a .npz file, with caching.
+
+    Handles INT8 dequantization and pre-transposes FC weights at load time.
+    """
     if path is None:
         path = _DEFAULT_WEIGHTS
 
@@ -351,10 +370,71 @@ def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
     if cached is not None:
         return cached
 
-    with np.load(str(resolved)) as data:
-        weights = {k: data[k] for k in data.files}
+    with np.load(str(resolved), allow_pickle=False) as data:
+        weights: dict[str, np.ndarray] = {}
+        for k in data.files:
+            weights[k] = data[k]
+
+    # INT8 dequantization: if we find int8 weights + scales, dequantize once
+    _dequantize_int8(weights)
+
+    # Optimizations only for new architecture (arch_version present)
+    is_new_arch = "arch_version" in weights
+
+    # Enforce float32 throughout to prevent accidental float64 upcast
+    for k in weights:
+        if weights[k].dtype in (np.float64, np.float16):
+            weights[k] = weights[k].astype(np.float32, copy=False)
+
+    if is_new_arch:
+        # Pre-transpose FC weights at load time to avoid transposing every call
+        for fc_name in ("fc1.weight", "fc2.weight"):
+            if fc_name in weights:
+                weights[fc_name + "_T"] = np.ascontiguousarray(
+                    weights[fc_name].T.astype(np.float32, copy=False)
+                )
+
+    _validate_class_count(weights, resolved)
+
     _cached_weights[resolved] = weights
     return weights
+
+
+def _validate_class_count(weights: dict[str, np.ndarray], path: Path) -> None:
+    """Fail fast if weights were trained with a different alphabet size."""
+    if "fc2.bias" in weights:
+        classes = int(weights["fc2.bias"].shape[0])
+    elif "fc2.weight" in weights:
+        classes = int(weights["fc2.weight"].shape[0])
+    elif "fc2.weight_T" in weights:
+        classes = int(weights["fc2.weight_T"].shape[1])
+    else:
+        return
+
+    if classes != NUM_CLASSES:
+        raise ValueError(
+            f"Incompatible weights at {path}: got {classes} output classes, "
+            f"expected {NUM_CLASSES}. Retrain and re-export weights for the current alphabet."
+        )
+
+
+def _dequantize_int8(weights: dict[str, np.ndarray]) -> None:
+    """Dequantize INT8 weights in-place if quantized keys are present."""
+    q_keys = [k for k in weights if k.endswith(".weight_q")]
+    for qk in q_keys:
+        base = qk[: -len("_q")]  # e.g. "conv1.weight"
+        scale_key = base + "_scale"
+        if scale_key not in weights:
+            continue
+        q_data = weights[qk].astype(np.float32)
+        scale = weights[scale_key].astype(np.float32)
+        # Per-channel: scale shape is (C_out,) or (C_out, 1, ...)
+        # Reshape scale to broadcast against weight shape
+        ndim = q_data.ndim
+        shape = [-1] + [1] * (ndim - 1)
+        weights[base] = q_data * scale.reshape(shape)
+        del weights[qk]
+        del weights[scale_key]
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +445,10 @@ def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
 #   conv1(1→16, 3x3, pad=1) → relu → maxpool(2x2)
 #   conv2(16→32, 3x3, pad=1) → relu → maxpool(2x2)
 #   conv3(32→64, 3x3, pad=1) → relu
-#   conv4(64→64, 3x3, pad=1) → relu
-#   reshape → fc1(512→128) → relu → fc2(128→63)
+#   conv4(64→64, 3x3, pad=1) → relu + residual(conv3)
+#   reshape → fc1(512→128) → relu → fc2(128→num_classes)
+# Note: BN is folded into conv weights at export time, so inference
+# sees only conv.weight and conv.bias (with BN absorbed).
 
 
 def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
@@ -379,8 +461,12 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
     Returns:
         2-D array of shape (T, num_classes) — logits per timestep.
     """
+    # Detect architecture version: residual connection is used when
+    # "arch_version" key is present (set by new export code).
+    use_residual = "arch_version" in weights
+
     # Add batch and channel dims: (H, W) → (1, 1, H, W)
-    x = img[np.newaxis, np.newaxis, :, :]
+    x = img[np.newaxis, np.newaxis, :, :].astype(np.float32, copy=False)
 
     # Conv block 1
     x = _conv2d(x, weights["conv1.weight"], weights["conv1.bias"], padding=1)
@@ -394,23 +480,32 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
 
     # Conv block 3
     x = _conv2d(x, weights["conv3.weight"], weights["conv3.bias"], padding=1)
-    x = _relu(x)
+    x3 = _relu(x)
 
-    # Conv block 4
-    x = _conv2d(x, weights["conv4.weight"], weights["conv4.bias"], padding=1)
-    x = _relu(x)
+    # Conv block 4, with optional residual from conv3
+    x = _conv2d(x3, weights["conv4.weight"], weights["conv4.bias"], padding=1)
+    if use_residual:
+        x = _relu(x + x3)
+    else:
+        x = _relu(x)
 
     # Reshape: (1, 64, 8, T) → (1, T, 512)
     b, c, h, w = x.shape
     x = np.transpose(x, (0, 3, 1, 2))  # (1, T, 64, 8)
     x = x.reshape(b, w, c * h)  # (1, T, 512)
 
-    # FC1
-    x = x @ weights["fc1.weight"].T + weights["fc1.bias"]
+    # FC1 — use pre-transposed weight if available
+    if "fc1.weight_T" in weights:
+        x = x @ weights["fc1.weight_T"] + weights["fc1.bias"]
+    else:
+        x = x @ weights["fc1.weight"].T + weights["fc1.bias"]
     x = _relu(x)
 
-    # FC2
-    x = x @ weights["fc2.weight"].T + weights["fc2.bias"]
+    # FC2 — use pre-transposed weight if available
+    if "fc2.weight_T" in weights:
+        x = x @ weights["fc2.weight_T"] + weights["fc2.bias"]
+    else:
+        x = x @ weights["fc2.weight"].T + weights["fc2.bias"]
 
     # Remove batch dim: (1, T, C) → (T, C)
     return x[0]

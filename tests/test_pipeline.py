@@ -255,13 +255,12 @@ class TestCTC:
 
     def test_greedy_decode_simple(self):
         """Greedy decode collapses repeated chars and removes blanks."""
-        from microocr.ctc import greedy_decode, BLANK_IDX
+        from microocr.ctc import greedy_decode, BLANK_IDX, CHARS
 
         # Simulate logits for "Hi" (H=33, i=8 in CHARS)
-        # CHARS = abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
         # H is at index 33, i is at index 8
         T = 8
-        C = 63
+        C = len(CHARS) + 1
         logits = np.full((T, C), -10.0, dtype=np.float32)
 
         # Timesteps: blank, H, H, blank, i, i, i, blank
@@ -279,9 +278,9 @@ class TestCTC:
 
     def test_greedy_decode_empty(self):
         """All-blank logits produce empty string."""
-        from microocr.ctc import greedy_decode, BLANK_IDX
+        from microocr.ctc import greedy_decode, BLANK_IDX, CHARS
 
-        logits = np.full((10, 63), -10.0, dtype=np.float32)
+        logits = np.full((10, len(CHARS) + 1), -10.0, dtype=np.float32)
         logits[:, BLANK_IDX] = 10.0  # all blanks
 
         result = greedy_decode(logits)
@@ -289,11 +288,11 @@ class TestCTC:
 
     def test_greedy_decode_repeated_with_blank(self):
         """Blank between same chars produces two of that char."""
-        from microocr.ctc import greedy_decode, BLANK_IDX
+        from microocr.ctc import greedy_decode, BLANK_IDX, CHARS
 
         # "aa" requires: a, blank, a
         T = 3
-        C = 63
+        C = len(CHARS) + 1
         logits = np.full((T, C), -10.0, dtype=np.float32)
         logits[0, 0] = 10.0  # a
         logits[1, BLANK_IDX] = 10.0  # blank
@@ -304,10 +303,10 @@ class TestCTC:
 
     def test_beam_decode_repeated_with_blank(self):
         """Beam decode handles repeated characters correctly."""
-        from microocr.ctc import beam_decode, BLANK_IDX
+        from microocr.ctc import beam_decode, BLANK_IDX, CHARS
 
         T = 8
-        C = 63
+        C = len(CHARS) + 1
         logits = np.full((T, C), -10.0, dtype=np.float32)
         logits[0, BLANK_IDX] = 10.0
         logits[1, 33] = 10.0  # H
@@ -343,10 +342,10 @@ class TestModel:
         x = torch.randn(2, 1, 32, 64)  # batch=2, width=64
         out = model(x)
 
-        assert out.shape == (64 // 4, 2, NUM_CLASSES)  # T=16, B=2, C=63
+        assert out.shape == (64 // 4, 2, NUM_CLASSES)  # T=16, B=2, C=num_classes
 
     def test_model_parameter_count(self):
-        """Model has roughly ~100K parameters."""
+        """Model has roughly ~100K parameters (including BN)."""
         try:
             import torch
         except ImportError:
@@ -388,7 +387,7 @@ class TestInference:
         assert out.shape == (1, 16, 16, 32)
 
     def test_numpy_matches_pytorch(self):
-        """NumPy forward pass matches PyTorch forward pass."""
+        """NumPy forward pass (with BN folding) matches PyTorch forward pass."""
         try:
             import torch
         except ImportError:
@@ -396,13 +395,20 @@ class TestInference:
 
         from microocr.model import MicroOCRModel
         from microocr.inference import _forward
+        from training.train import fold_bn_into_conv
 
         model = MicroOCRModel()
+        # Run dummy forward in train mode to initialize BN running stats
+        dummy = torch.randn(4, 1, 32, 64)
+        model.train()
+        with torch.no_grad():
+            model(dummy)
         model.eval()
 
-        # Get weights as numpy
-        state = model.state_dict()
-        weights = {k: v.numpy() for k, v in state.items()}
+        # Fold BN into conv weights for NumPy inference
+        weights = fold_bn_into_conv(model)
+        # Add arch_version to enable residual connection in inference
+        weights["arch_version"] = np.array([2], dtype=np.int32)
 
         # Create test input
         rng = np.random.default_rng(42)
@@ -476,6 +482,7 @@ class TestSynthData:
             pytest.skip("Pillow not installed")
 
         from training.synth_data import generate_sample
+        from microocr.model import CHARS
         from microocr.preprocess import TARGET_HEIGHT
 
         rng = np.random.default_rng(123)
@@ -485,7 +492,7 @@ class TestSynthData:
         assert img.shape[0] == TARGET_HEIGHT
         assert img.dtype == np.float32
         assert len(label) > 0
-        assert all(c.isalnum() for c in label)
+        assert all(c in CHARS for c in label)
 
     def test_generate_batch(self):
         """Batch generation returns correct number of samples."""
@@ -501,6 +508,25 @@ class TestSynthData:
 
         assert len(images) == 5
         assert len(labels) == 5
+
+    def test_generate_batch_includes_whitespace_and_specials(self):
+        """Synthetic generator emits spaces and special chars over enough samples."""
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        from training.synth_data import generate_batch
+        from microocr.model import CHARS
+
+        rng = np.random.default_rng(2026)
+        _, labels = generate_batch(400, rng=rng, apply_augment=False)
+        chars = set("".join(labels))
+        has_space = " " in chars
+        has_special = any((c in CHARS) and (not c.isalnum()) and c != " " for c in chars)
+
+        assert has_space
+        assert has_special
 
 
 # ---------------------------------------------------------------------------
@@ -532,3 +558,164 @@ class TestAugment:
 
         assert augmented.min() >= 0.0
         assert augmented.max() <= 1.0
+
+    def test_random_erasing(self):
+        """Random erasing changes some pixels to near-white."""
+        from training.augment import random_erasing
+
+        rng = np.random.default_rng(42)
+        img = np.full((32, 100), 0.5, dtype=np.float32)
+        out = random_erasing(img, rng)
+        assert out.shape == img.shape
+        # At least some pixels should have changed
+        assert not np.array_equal(img, out)
+
+    def test_salt_and_pepper(self):
+        """Salt-and-pepper noise adds 0 and 1 valued pixels."""
+        from training.augment import salt_and_pepper
+
+        rng = np.random.default_rng(42)
+        img = np.full((32, 100), 0.5, dtype=np.float32)
+        out = salt_and_pepper(img, rng, amount=0.05)
+        assert out.shape == img.shape
+        assert np.any(out == 0.0) or np.any(out == 1.0)
+
+    def test_elastic_distortion(self):
+        """Elastic distortion preserves shape."""
+        from training.augment import elastic_distortion
+
+        rng = np.random.default_rng(42)
+        img = np.random.rand(32, 100).astype(np.float32)
+        out = elastic_distortion(img, rng)
+        assert out.shape == img.shape
+        assert out.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# Test: BN fold correctness
+# ---------------------------------------------------------------------------
+
+
+class TestBNFold:
+    """Tests for BatchNorm folding into conv weights."""
+
+    def test_bn_fold_matches_pytorch(self):
+        """Folded BN weights produce identical output to PyTorch eval mode."""
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+
+        from microocr.model import MicroOCRModel
+        from microocr.inference import _forward
+        from training.train import fold_bn_into_conv
+
+        model = MicroOCRModel()
+        # Run a dummy forward to initialize BN running stats
+        dummy = torch.randn(4, 1, 32, 64)
+        model.train()
+        with torch.no_grad():
+            model(dummy)
+        model.eval()
+
+        # Fold BN into conv weights
+        folded_weights = fold_bn_into_conv(model)
+        # Add arch_version to enable residual connection in inference
+        folded_weights["arch_version"] = np.array([2], dtype=np.int32)
+
+        # Test input
+        rng = np.random.default_rng(42)
+        img_np = rng.random((32, 64), dtype=np.float64).astype(np.float32)
+
+        # NumPy forward with folded weights
+        np_out = _forward(img_np, folded_weights)
+
+        # PyTorch forward (BN in eval mode)
+        with torch.no_grad():
+            pt_input = torch.tensor(img_np).unsqueeze(0).unsqueeze(0)
+            pt_out = model(pt_input)  # (T, 1, C)
+            pt_out = pt_out[:, 0, :].numpy()  # (T, C)
+
+        assert np_out.shape == pt_out.shape
+        max_diff = np.max(np.abs(np_out - pt_out))
+        assert max_diff < 1e-5, f"BN fold max diff = {max_diff}"
+
+    def test_bn_fold_key_names(self):
+        """Folded weights have standard conv key names."""
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+
+        from microocr.model import MicroOCRModel
+        from training.train import fold_bn_into_conv
+
+        model = MicroOCRModel()
+        folded = fold_bn_into_conv(model)
+
+        expected_keys = {
+            "conv1.weight", "conv1.bias",
+            "conv2.weight", "conv2.bias",
+            "conv3.weight", "conv3.bias",
+            "conv4.weight", "conv4.bias",
+            "fc1.weight", "fc1.bias",
+            "fc2.weight", "fc2.bias",
+        }
+        assert set(folded.keys()) == expected_keys
+
+
+# ---------------------------------------------------------------------------
+# Test: INT8 quantization round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestQuantization:
+    """Tests for INT8 weight quantization and dequantization."""
+
+    def test_quantize_roundtrip(self):
+        """Quantize then dequantize produces close-to-original weights."""
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+
+        from training.train import fold_bn_into_conv, _quantize_weights_int8
+        from microocr.inference import _dequantize_int8
+        from microocr.model import MicroOCRModel
+
+        model = MicroOCRModel()
+        original = fold_bn_into_conv(model)
+        quantized = _quantize_weights_int8(original)
+
+        # Dequantize
+        _dequantize_int8(quantized)
+
+        # Check that weight keys are restored
+        for key in ("conv1.weight", "conv2.weight", "conv3.weight", "conv4.weight"):
+            assert key in quantized, f"Missing {key} after dequant"
+            diff = np.abs(original[key] - quantized[key])
+            max_diff = diff.max()
+            # INT8 quantization error should be small relative to weight range
+            weight_range = np.abs(original[key]).max()
+            rel_error = max_diff / max(weight_range, 1e-8)
+            assert rel_error < 0.02, (
+                f"{key}: relative error {rel_error:.4f} too large"
+            )
+
+    def test_quantize_preserves_biases(self):
+        """Biases are kept as float32 (not quantized)."""
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+
+        from training.train import fold_bn_into_conv, _quantize_weights_int8
+        from microocr.model import MicroOCRModel
+
+        model = MicroOCRModel()
+        original = fold_bn_into_conv(model)
+        quantized = _quantize_weights_int8(original)
+
+        for key in ("conv1.bias", "fc1.bias", "fc2.bias"):
+            assert key in quantized
+            np.testing.assert_array_equal(original[key], quantized[key])

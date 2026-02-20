@@ -2,7 +2,7 @@
 Training script for MicroOCR.
 
 Usage:
-    python -m training.train [--epochs 50] [--batch-size 32] [--lr 0.001]
+    python -m training.train [--epochs 50] [--batch-size 32] [--lr 0.01]
 
 Trains the MicroOCR CNN with CTC loss on synthetically generated text
 images. Exports trained weights as both ``.pth`` (PyTorch) and ``.npz``
@@ -73,7 +73,7 @@ def collate_batch(
 def train(
     epochs: int = 50,
     batch_size: int = 32,
-    lr: float = 0.001,
+    lr: float = 0.01,
     batches_per_epoch: int = 200,
     output_dir: str = "output",
     seed: int = 42,
@@ -85,7 +85,7 @@ def train(
     Args:
         epochs: Number of training epochs.
         batch_size: Batch size.
-        lr: Learning rate.
+        lr: Peak learning rate for OneCycleLR.
         batches_per_epoch: Number of batches per epoch.
         output_dir: Directory to save model weights.
         seed: Random seed.
@@ -103,13 +103,18 @@ def train(
     model = MicroOCRModel(num_classes=NUM_CLASSES).to(device)
     print(f"Model parameters: {model.count_parameters():,}")
 
-    # Optimizer and loss
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # Optimizer: AdamW with weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     ctc_loss = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
 
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+    # OneCycleLR scheduler — stepped per batch
+    total_steps = epochs * batches_per_epoch
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy="cos",
     )
 
     out_path = Path(output_dir)
@@ -120,6 +125,9 @@ def train(
 
     best_val_cer = float("inf")
     best_val_word_acc = 0.0
+
+    # Entropy regularization weight
+    entropy_weight = 0.01
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -142,6 +150,11 @@ def train(
             # CTC loss
             loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
+            # Entropy regularization: encourage less overconfident predictions
+            probs = log_probs.exp()
+            entropy = -(probs * log_probs).sum(dim=2).mean()
+            loss = loss - entropy_weight * entropy
+
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
@@ -150,6 +163,7 @@ def train(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
 
             optimizer.step()
+            scheduler.step()
             epoch_loss += loss.item()
 
             if batch_idx % 50 == 0:
@@ -174,8 +188,6 @@ def train(
         val_cer = val["cer"]
         val_word_acc = val["word_acc"]
         print(f"  val_cer={val_cer:.4f}  val_word_acc={val_word_acc:.4f}")
-
-        scheduler.step(val_cer)
 
         # Save best model
         if val_cer < best_val_cer:
@@ -214,10 +226,47 @@ def _evaluate_model(
     images: list[np.ndarray],
     labels: list[str],
 ) -> dict[str, float]:
-    """Evaluate current model weights with NumPy inference."""
-    state = model.state_dict()
-    weights = {k: v.detach().cpu().numpy() for k, v in state.items()}
+    """Evaluate current model weights with NumPy inference (BN-folded)."""
+    weights = fold_bn_into_conv(model)
     return evaluate_arrays(weights, images, labels)
+
+
+def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
+    """Fold BatchNorm parameters into conv weights and biases.
+
+    For each conv+BN pair, computes:
+        w_folded = (gamma / sqrt(var + eps)) * w
+        b_folded = (gamma / sqrt(var + eps)) * (b - mean) + beta
+
+    Returns a dict with keys like 'conv1.weight', 'conv1.bias', etc.
+    that can be used directly by the NumPy inference engine.
+    """
+    model.eval()
+    state = model.state_dict()
+    result: dict[str, np.ndarray] = {}
+
+    for i in range(1, 5):
+        conv_w = state[f"conv{i}.weight"].cpu().numpy()
+        conv_b = state[f"conv{i}.bias"].cpu().numpy()
+        bn_gamma = state[f"bn{i}.weight"].cpu().numpy()
+        bn_beta = state[f"bn{i}.bias"].cpu().numpy()
+        bn_mean = state[f"bn{i}.running_mean"].cpu().numpy()
+        bn_var = state[f"bn{i}.running_var"].cpu().numpy()
+        eps = 1e-5  # PyTorch default BN epsilon
+
+        scale = bn_gamma / np.sqrt(bn_var + eps)
+        # Reshape scale for broadcasting: (C_out,) → (C_out, 1, 1, 1)
+        w_folded = conv_w * scale.reshape(-1, 1, 1, 1)
+        b_folded = scale * (conv_b - bn_mean) + bn_beta
+
+        result[f"conv{i}.weight"] = w_folded.astype(np.float32)
+        result[f"conv{i}.bias"] = b_folded.astype(np.float32)
+
+    # Copy FC layers directly
+    for key in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"):
+        result[key] = state[key].cpu().numpy().astype(np.float32)
+
+    return result
 
 
 def _save_model(model: MicroOCRModel, path: Path) -> None:
@@ -225,18 +274,63 @@ def _save_model(model: MicroOCRModel, path: Path) -> None:
     torch.save(model.state_dict(), str(path))
 
 
-def _export_npz(model: MicroOCRModel, path: Path) -> None:
-    """Export model weights as NumPy .npz for inference without PyTorch."""
-    state = model.state_dict()
-    arrays = {k: v.cpu().numpy() for k, v in state.items()}
+def _export_npz(
+    model: MicroOCRModel,
+    path: Path,
+    *,
+    quantize_int8: bool = False,
+) -> None:
+    """Export model weights as NumPy .npz for inference without PyTorch.
+
+    BN is folded into conv weights so inference sees only conv.weight/bias.
+    Includes arch_version sentinel to enable residual connection in inference.
+    Optionally quantizes weights to INT8 for smaller file size.
+    """
+    arrays = fold_bn_into_conv(model)
+
+    # Architecture version marker: enables residual connection in inference
+    arrays["arch_version"] = np.array([2], dtype=np.int32)
+
+    if quantize_int8:
+        arrays = _quantize_weights_int8(arrays)
+
     np.savez(str(path), **arrays)
+
+
+def _quantize_weights_int8(
+    weights: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Per-channel INT8 quantization of weight tensors.
+
+    For each weight tensor, computes per-channel (axis 0) scale factors
+    and stores int8 data + scale. Bias tensors are kept as float32.
+    """
+    result: dict[str, np.ndarray] = {}
+    for key, arr in weights.items():
+        if key.endswith(".weight") and arr.ndim >= 2:
+            # Per-channel quantization along axis 0
+            abs_max = np.abs(arr).reshape(arr.shape[0], -1).max(axis=1)
+            abs_max = np.maximum(abs_max, 1e-8)  # avoid division by zero
+            scale = abs_max / 127.0
+            shape = [-1] + [1] * (arr.ndim - 1)
+            q = np.round(arr / scale.reshape(shape)).astype(np.int8)
+            result[key + "_q"] = q
+            result[key + "_scale"] = scale.astype(np.float32)
+        else:
+            result[key] = arr
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train MicroOCR model")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.01,
+        help="Peak learning rate for OneCycleLR",
+    )
     parser.add_argument(
         "--batches-per-epoch",
         type=int,
@@ -261,6 +355,11 @@ def main():
         type=int,
         default=1337,
         help="Validation RNG seed",
+    )
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Export INT8 quantized weights",
     )
     args = parser.parse_args()
 

@@ -14,7 +14,7 @@ if __name__ == "__main__":
     train(
         epochs=10,
         batch_size=32,
-        lr=0.001,
+        lr=0.0005,
         batches_per_epoch=200,
         output_dir="output",
         seed=42,

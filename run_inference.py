@@ -25,7 +25,12 @@ def generate_test_image() -> tuple[str, str]:
     """Render a known string to a PNG and return (base64, expected_text)."""
     from PIL import Image, ImageDraw, ImageFont
 
-    text = "Hello123"
+    text = """
+    if we need to build a new ocr from scratch, i mean let's forget all the actual technic of converting image to text.
+the main idea is to start from a base64 content from image contening a text and convert it to token.
+be creative and let's brainstomre how can we build a new framework in python to be efficient , capacle to run in constrained hardware liike phone or web browser.
+keep it simple and only focused on coverting base64 content to text toekn, we dont need to have an llm that understand or interpret just converting image to text as OCR
+    """
 
     # Render
     font_size = 32

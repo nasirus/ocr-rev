@@ -75,13 +75,52 @@ def evaluate_pth(
     num_samples: int = 256,
     seed: int = 1337,
 ) -> dict[str, float]:
-    """Evaluate a PyTorch checkpoint by running NumPy inference."""
+    """Evaluate a PyTorch checkpoint by running NumPy inference.
+
+    If the checkpoint contains BN keys, BN is folded into conv weights
+    before evaluation.
+    """
     import torch
 
     state = torch.load(str(pth_path), map_location="cpu", weights_only=True)
     weights = {k: v.cpu().numpy() for k, v in state.items()}
+
+    # If BN keys exist, fold them into conv weights
+    if any(k.startswith("bn") for k in weights):
+        weights = _fold_bn_from_state_dict(weights)
+
     images, labels = build_eval_set(num_samples=num_samples, seed=seed)
     return evaluate_arrays(weights, images, labels)
+
+
+def _fold_bn_from_state_dict(state: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Fold BN parameters from a raw state dict into conv weights."""
+    result: dict[str, np.ndarray] = {}
+    eps = 1e-5
+
+    for i in range(1, 5):
+        conv_w = state[f"conv{i}.weight"]
+        conv_b = state[f"conv{i}.bias"]
+        bn_key = f"bn{i}"
+        if f"{bn_key}.weight" in state:
+            gamma = state[f"{bn_key}.weight"]
+            beta = state[f"{bn_key}.bias"]
+            mean = state[f"{bn_key}.running_mean"]
+            var = state[f"{bn_key}.running_var"]
+            scale = gamma / np.sqrt(var + eps)
+            w_folded = conv_w * scale.reshape(-1, 1, 1, 1)
+            b_folded = scale * (conv_b - mean) + beta
+            result[f"conv{i}.weight"] = w_folded.astype(np.float32)
+            result[f"conv{i}.bias"] = b_folded.astype(np.float32)
+        else:
+            result[f"conv{i}.weight"] = conv_w
+            result[f"conv{i}.bias"] = conv_b
+
+    for key in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"):
+        if key in state:
+            result[key] = state[key].astype(np.float32)
+
+    return result
 
 
 def edit_distance(a: str, b: str) -> int:
