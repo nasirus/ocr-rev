@@ -67,6 +67,12 @@ def beam_decode(
         Decoded string (best beam).
     """
     T, C = logits.shape
+    if C != len(CHARS) + 1:
+        raise ValueError(
+            f"Expected logits with {len(CHARS) + 1} classes, got shape {logits.shape}"
+        )
+    if beam_width < 1:
+        raise ValueError("beam_width must be >= 1")
 
     # Softmax over classes
     log_probs = _log_softmax(logits)
@@ -96,11 +102,12 @@ def beam_decode(
                 lp = log_probs[t, c]
 
                 if prefix and prefix[-1] == c:
-                    # Same char as last: only extend from blank path
-                    _add_beam(new_beams, prefix, float("-inf"), p_b + lp)
-                    # Also allow new repeated char
+                    # CTC repeated-char rule:
+                    # - keep same prefix only from nonblank path
+                    _add_beam(new_beams, prefix, float("-inf"), p_nb + lp)
+                    # - append repeated char only from blank path
                     new_prefix = prefix + (c,)
-                    _add_beam(new_beams, new_prefix, float("-inf"), p_total + lp)
+                    _add_beam(new_beams, new_prefix, float("-inf"), p_b + lp)
                 else:
                     new_prefix = prefix + (c,)
                     _add_beam(new_beams, new_prefix, float("-inf"), p_total + lp)

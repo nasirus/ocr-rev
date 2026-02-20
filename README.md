@@ -38,12 +38,14 @@ training/
   synth_data.py     # Synthetic text rendering
   augment.py        # Numpy augmentations
   train.py          # Training loop and checkpoint export
+  eval.py           # Internal deterministic CER/word-acc evaluation
 
 tests/
   test_pipeline.py  # Unit/integration coverage across modules
 
 run_training.py     # Opinionated training entrypoint
 run_inference.py    # Quick inference demo script
+benchmark_inference.py  # Stage-wise latency benchmark (p50/p95)
 main.py             # Minimal CLI-style project info
 ```
 
@@ -124,7 +126,8 @@ Expected artifacts in `output/`:
 - `microocr_best.pth`
 - `microocr_epoch10.pth`, `microocr_epoch20.pth`, ...
 - `microocr_final.pth`
-- `microocr.npz` (NumPy inference weights, produced at end of training)
+- `microocr.npz` (NumPy weights from best validation CER checkpoint)
+- `microocr_final.npz` (NumPy weights from final epoch)
 
 Training also exports to package path:
 - `microocr/weights/microocr.npz`
@@ -152,6 +155,18 @@ import microocr
 # base64_string can be plain base64 or data URI
 text = microocr.read(base64_string, weights_path="output/microocr.npz")
 
+# Optional controls:
+# - decode_mode: "greedy" (default) or "beam"
+# - reject_blank: suppress false positives on blank/near-blank lines
+# - max_line_width: optional latency guardrail for long lines
+text = microocr.read(
+    base64_string,
+    weights_path="output/microocr.npz",
+    decode_mode="greedy",
+    reject_blank=True,
+    max_line_width=None,
+)
+
 # or from file
 text2 = microocr.read_file("sample.png", weights_path="output/microocr.npz")
 ```
@@ -163,10 +178,25 @@ text2 = microocr.read_file("sample.png", weights_path="output/microocr.npz")
 2. `binarize`: adaptive local thresholding.
 3. `segment_lines`: horizontal projection line segmentation.
 4. Per line:
-   - `preprocess` (crop-to-content + resize to height 32 + normalize)
+   - `preprocess` (crop-to-content + resize to height 32 + normalize; no second binarization pass)
    - `_forward` (pure NumPy CNN)
-   - `greedy_decode` (CTC decoding)
+   - `greedy_decode` or `beam_decode` (CTC decoding, configurable)
+   - blank-line rejection gate (optional, enabled by default)
 5. Join line results with `\n`.
+
+## Evaluation and Benchmarking
+
+Internal deterministic checkpoint evaluation (fixed synthetic set):
+
+```bash
+python -m training.eval output/microocr_best.pth --samples 256 --seed 1337
+```
+
+Inference stage benchmark (decode/segment/preprocess/forward/decode/total, p50/p95):
+
+```bash
+python benchmark_inference.py --weights-path output/microocr.npz --samples 64
+```
 
 ## Exporting Trained Models
 
@@ -188,7 +218,7 @@ Run tests with:
 uv run pytest -q
 ```
 
-Current repo baseline: `24 passed` (local run in this workspace).
+Current repo baseline: `31 passed` (local run in this workspace).
 
 Coverage includes:
 - Image decode (PNG, data URI handling, invalid format behavior)

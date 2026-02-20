@@ -25,7 +25,7 @@ except ImportError:
     )
     raise
 
-from microocr.preprocess import TARGET_HEIGHT
+from microocr.preprocess import TARGET_HEIGHT, preprocess
 from training.augment import augment
 
 
@@ -40,6 +40,7 @@ def generate_sample(
     font_size_range: tuple[int, int] = (20, 40),
     target_height: int = TARGET_HEIGHT,
     apply_augment: bool = True,
+    align_with_inference: bool = True,
 ) -> tuple[np.ndarray, str]:
     """Generate a single synthetic (image, label) pair.
 
@@ -50,6 +51,8 @@ def generate_sample(
         font_size_range: Range of font sizes to sample from.
         target_height: Target image height after preprocessing.
         apply_augment: Whether to apply data augmentation.
+        align_with_inference: If True, run the same crop/resize pipeline
+            as runtime inference.
 
     Returns:
         Tuple of:
@@ -69,22 +72,27 @@ def generate_sample(
     # Render text to image
     img = _render_text(label, font_size, rng)
 
-    # Convert to float32 [0, 1]
-    img_f = img.astype(np.float32) / 255.0
-
-    # Resize to target height
-    from microocr.preprocess import resize_height
-
-    img_f = (
-        resize_height((img_f * 255).astype(np.uint8), target_height).astype(np.float32)
-        / 255.0
-    )
-
     # Augment
+    img_f = img.astype(np.float32) / 255.0
     if apply_augment:
         img_f = augment(img_f, rng)
 
-    return img_f, label
+    img_u8 = np.clip(img_f * 255.0, 0.0, 255.0).astype(np.uint8)
+    if align_with_inference:
+        img_out = preprocess(
+            img_u8,
+            target_height=target_height,
+            already_binary=False,
+            resize_mode="bilinear",
+        )
+    else:
+        from microocr.preprocess import resize_height
+
+        img_out = (
+            resize_height(img_u8, target_height, mode="bilinear").astype(np.float32) / 255.0
+        )
+
+    return img_out, label
 
 
 def generate_batch(

@@ -11,21 +11,22 @@ via ``export.py``).
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
+from time import perf_counter
+from typing import Literal
 
 import numpy as np
 
-from microocr.ctc import greedy_decode
+from microocr.ctc import BLANK_IDX, beam_decode, greedy_decode
 from microocr.decode import decode_base64
-from microocr.preprocess import preprocess, TARGET_HEIGHT
+from microocr.preprocess import TARGET_HEIGHT, binarize, preprocess
 from microocr.segment import segment_lines
 
 # Default model weights path
 _DEFAULT_WEIGHTS = Path(__file__).parent / "weights" / "microocr.npz"
 
-# Cached weights (loaded once)
-_cached_weights: dict[str, np.ndarray] | None = None
+# Cached weights keyed by absolute path
+_cached_weights: dict[Path, dict[str, np.ndarray]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,15 @@ _cached_weights: dict[str, np.ndarray] | None = None
 def read(
     b64_string: str,
     weights_path: str | Path | None = None,
+    *,
+    decode_mode: Literal["greedy", "beam"] = "greedy",
+    reject_blank: bool = True,
+    reject_blank_ratio: float = 0.90,
+    reject_nonblank_peak: float = 0.55,
+    max_line_width: int | None = None,
+    low_confidence_beam_fallback: bool = False,
+    fallback_margin: float = 0.05,
+    beam_width: int = 10,
 ) -> str:
     """Read text from a base64-encoded image.
 
@@ -45,6 +55,19 @@ def read(
         b64_string: Base64-encoded image (PNG or JPEG).
         weights_path: Path to ``.npz`` model weights. If None, uses
             the bundled default weights.
+        decode_mode: ``"greedy"`` (fast) or ``"beam"`` (more exhaustive).
+        reject_blank: If True, suppress line output when logits indicate
+            mostly blank content.
+        reject_blank_ratio: Minimum argmax-blank ratio to treat as blank line.
+        reject_nonblank_peak: Maximum allowed nonblank probability peak when
+            rejecting blank lines.
+        max_line_width: Optional cap on preprocessed line width to reduce
+            latency spikes on very long lines.
+        low_confidence_beam_fallback: If True, run beam decode on lines where
+            greedy confidence margin is low.
+        fallback_margin: Mean top1-top2 probability margin threshold for
+            greedy-to-beam fallback.
+        beam_width: Beam width used by beam decoder.
 
     Returns:
         Recognized text string.
@@ -54,32 +77,34 @@ def read(
         import microocr
         text = microocr.read("iVBORw0KGgoAAAANSUhEUg...")
     """
-    weights = _load_weights(weights_path)
-
-    # Decode base64 → grayscale pixels
-    gray = decode_base64(b64_string)
-
-    # Segment into lines
-    from microocr.preprocess import binarize
-
-    binary = binarize(gray)
-    lines = segment_lines(binary)
-
-    # Recognize each line
-    results: list[str] = []
-    for line_img in lines:
-        processed = preprocess(line_img, target_height=TARGET_HEIGHT)
-        logits = _forward(processed, weights)
-        text = greedy_decode(logits)
-        if text:
-            results.append(text)
-
-    return "\n".join(results)
+    text, _ = _read_impl(
+        b64_string=b64_string,
+        weights_path=weights_path,
+        decode_mode=decode_mode,
+        reject_blank=reject_blank,
+        reject_blank_ratio=reject_blank_ratio,
+        reject_nonblank_peak=reject_nonblank_peak,
+        max_line_width=max_line_width,
+        low_confidence_beam_fallback=low_confidence_beam_fallback,
+        fallback_margin=fallback_margin,
+        beam_width=beam_width,
+        collect_timing=False,
+    )
+    return text
 
 
 def read_file(
     filepath: str | Path,
     weights_path: str | Path | None = None,
+    *,
+    decode_mode: Literal["greedy", "beam"] = "greedy",
+    reject_blank: bool = True,
+    reject_blank_ratio: float = 0.90,
+    reject_nonblank_peak: float = 0.55,
+    max_line_width: int | None = None,
+    low_confidence_beam_fallback: bool = False,
+    fallback_margin: float = 0.05,
+    beam_width: int = 10,
 ) -> str:
     """Read text from an image file.
 
@@ -101,7 +126,206 @@ def read_file(
 
     raw = path.read_bytes()
     b64 = base64.b64encode(raw).decode("ascii")
-    return read(b64, weights_path=weights_path)
+    return read(
+        b64,
+        weights_path=weights_path,
+        decode_mode=decode_mode,
+        reject_blank=reject_blank,
+        reject_blank_ratio=reject_blank_ratio,
+        reject_nonblank_peak=reject_nonblank_peak,
+        max_line_width=max_line_width,
+        low_confidence_beam_fallback=low_confidence_beam_fallback,
+        fallback_margin=fallback_margin,
+        beam_width=beam_width,
+    )
+
+
+def _read_with_timing(
+    b64_string: str,
+    weights_path: str | Path | None = None,
+    *,
+    decode_mode: Literal["greedy", "beam"] = "greedy",
+    reject_blank: bool = True,
+    reject_blank_ratio: float = 0.90,
+    reject_nonblank_peak: float = 0.55,
+    max_line_width: int | None = None,
+    low_confidence_beam_fallback: bool = False,
+    fallback_margin: float = 0.05,
+    beam_width: int = 10,
+) -> tuple[str, dict[str, float]]:
+    """Internal helper that runs OCR and returns stage timings in ms."""
+    text, timings = _read_impl(
+        b64_string=b64_string,
+        weights_path=weights_path,
+        decode_mode=decode_mode,
+        reject_blank=reject_blank,
+        reject_blank_ratio=reject_blank_ratio,
+        reject_nonblank_peak=reject_nonblank_peak,
+        max_line_width=max_line_width,
+        low_confidence_beam_fallback=low_confidence_beam_fallback,
+        fallback_margin=fallback_margin,
+        beam_width=beam_width,
+        collect_timing=True,
+    )
+    assert timings is not None
+    return text, timings
+
+
+def _read_impl(
+    b64_string: str,
+    weights_path: str | Path | None,
+    *,
+    decode_mode: Literal["greedy", "beam"],
+    reject_blank: bool,
+    reject_blank_ratio: float,
+    reject_nonblank_peak: float,
+    max_line_width: int | None,
+    low_confidence_beam_fallback: bool,
+    fallback_margin: float,
+    beam_width: int,
+    collect_timing: bool,
+) -> tuple[str, dict[str, float] | None]:
+    if decode_mode not in ("greedy", "beam"):
+        raise ValueError(f"Unsupported decode mode: {decode_mode}")
+    if beam_width < 1:
+        raise ValueError("beam_width must be >= 1")
+    if max_line_width is not None and max_line_width < 1:
+        raise ValueError("max_line_width must be >= 1")
+
+    timings: dict[str, float] | None = None
+    total_start = perf_counter()
+    if collect_timing:
+        timings = {
+            "decode_ms": 0.0,
+            "segment_ms": 0.0,
+            "preprocess_ms": 0.0,
+            "forward_ms": 0.0,
+            "decode_ctc_ms": 0.0,
+            "total_ms": 0.0,
+        }
+
+    weights = _load_weights(weights_path)
+
+    # Decode base64 → grayscale pixels
+    t = perf_counter()
+    gray = decode_base64(b64_string)
+    _accum_ms(timings, "decode_ms", t)
+
+    # Segment into lines (single binarization pass)
+    t = perf_counter()
+    binary = binarize(gray)
+    lines = segment_lines(binary)
+    _accum_ms(timings, "segment_ms", t)
+
+    # Recognize each line
+    results: list[str] = []
+    for line_img in lines:
+        t = perf_counter()
+        processed = preprocess(
+            line_img,
+            target_height=TARGET_HEIGHT,
+            already_binary=True,
+            resize_mode="bilinear",
+        )
+        if max_line_width is not None and processed.shape[1] > max_line_width:
+            processed = _downsample_width(processed, max_line_width)
+        _accum_ms(timings, "preprocess_ms", t)
+
+        t = perf_counter()
+        logits = _forward(processed, weights)
+        _accum_ms(timings, "forward_ms", t)
+
+        t = perf_counter()
+        text = _decode_line(
+            logits=logits,
+            decode_mode=decode_mode,
+            reject_blank=reject_blank,
+            reject_blank_ratio=reject_blank_ratio,
+            reject_nonblank_peak=reject_nonblank_peak,
+            low_confidence_beam_fallback=low_confidence_beam_fallback,
+            fallback_margin=fallback_margin,
+            beam_width=beam_width,
+        )
+        _accum_ms(timings, "decode_ctc_ms", t)
+
+        if text:
+            results.append(text)
+
+    out = "\n".join(results)
+    if timings is not None:
+        timings["total_ms"] = (perf_counter() - total_start) * 1000.0
+    return out, timings
+
+
+def _accum_ms(
+    timings: dict[str, float] | None,
+    key: str,
+    start_time: float,
+) -> None:
+    if timings is not None:
+        timings[key] += (perf_counter() - start_time) * 1000.0
+
+
+def _decode_line(
+    logits: np.ndarray,
+    decode_mode: Literal["greedy", "beam"],
+    reject_blank: bool,
+    reject_blank_ratio: float,
+    reject_nonblank_peak: float,
+    low_confidence_beam_fallback: bool,
+    fallback_margin: float,
+    beam_width: int,
+) -> str:
+    if reject_blank:
+        blank_ratio, nonblank_peak = _blank_line_stats(logits)
+        if blank_ratio >= reject_blank_ratio and nonblank_peak < reject_nonblank_peak:
+            return ""
+
+    if decode_mode == "beam":
+        return beam_decode(logits, beam_width=beam_width)
+
+    text = greedy_decode(logits)
+    if low_confidence_beam_fallback and _mean_top1_margin(logits) < fallback_margin:
+        return beam_decode(logits, beam_width=beam_width)
+    return text
+
+
+def _blank_line_stats(logits: np.ndarray) -> tuple[float, float]:
+    """Return (blank argmax ratio, max nonblank posterior peak)."""
+    best = np.argmax(logits, axis=1)
+    blank_ratio = float(np.mean(best == BLANK_IDX))
+
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    nonblank_peak = float(probs[:, :BLANK_IDX].max()) if BLANK_IDX > 0 else 0.0
+    return blank_ratio, nonblank_peak
+
+
+def _mean_top1_margin(logits: np.ndarray) -> float:
+    """Average top1-top2 posterior margin across timesteps."""
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    probs = exp / exp.sum(axis=1, keepdims=True)
+    top2 = np.partition(probs, -2, axis=1)[:, -2:]
+    margin = top2.max(axis=1) - top2.min(axis=1)
+    return float(margin.mean())
+
+
+def _downsample_width(img: np.ndarray, target_width: int) -> np.ndarray:
+    """Downsample width only using linear interpolation."""
+    h, w = img.shape
+    if w <= target_width:
+        return img
+    if target_width == 1:
+        return img[:, :1]
+
+    x = np.linspace(0.0, w - 1.0, target_width, dtype=np.float32)
+    x0 = np.floor(x).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    wx = x - x0
+    out = img[:, x0] * (1.0 - wx)[np.newaxis, :] + img[:, x1] * wx[np.newaxis, :]
+    return out.astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -111,15 +335,10 @@ def read_file(
 
 def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
     """Load model weights from a .npz file, with caching."""
-    global _cached_weights
-
     if path is None:
         path = _DEFAULT_WEIGHTS
 
-    path = Path(path)
-
-    if _cached_weights is not None:
-        return _cached_weights
+    path = Path(path).expanduser()
 
     if not path.exists():
         raise FileNotFoundError(
@@ -127,9 +346,14 @@ def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
             "Train a model first with: python -m training.train"
         )
 
-    data = np.load(str(path))
-    weights = {k: data[k] for k in data.files}
-    _cached_weights = weights
+    resolved = path.resolve()
+    cached = _cached_weights.get(resolved)
+    if cached is not None:
+        return cached
+
+    with np.load(str(resolved)) as data:
+        weights = {k: data[k] for k in data.files}
+    _cached_weights[resolved] = weights
     return weights
 
 
@@ -234,9 +458,7 @@ def _conv2d(
     cols = _im2col(x, kH, kW, H_out, W_out)  # (B, C_in*kH*kW, H_out*W_out)
     w_flat = weight.reshape(C_out, -1)  # (C_out, C_in*kH*kW)
 
-    # Matrix multiply
-    out = w_flat @ cols  # (B, C_out, H_out*W_out) — broadcast over batch via loop
-    # Actually: cols is (B, patch, spatial), we need per-batch matmul
+    # Per-batch matrix multiply.
     out = np.einsum("ij,bjk->bik", w_flat, cols)  # (B, C_out, H_out*W_out)
     out = out.reshape(B, C_out, H_out, W_out)
     out += bias[np.newaxis, :, np.newaxis, np.newaxis]

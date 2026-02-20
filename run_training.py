@@ -12,7 +12,7 @@ from training.train import train
 
 if __name__ == "__main__":
     train(
-        epochs=50,
+        epochs=10,
         batch_size=32,
         lr=0.001,
         batches_per_epoch=200,

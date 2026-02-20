@@ -12,7 +12,7 @@ images. Exports trained weights as both ``.pth`` (PyTorch) and ``.npz``
 from __future__ import annotations
 
 import argparse
-import sys
+import shutil
 import time
 from pathlib import Path
 
@@ -21,8 +21,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from microocr.model import MicroOCRModel, CHARS, BLANK_IDX, NUM_CLASSES, char_to_index
+from microocr.model import BLANK_IDX, NUM_CLASSES, MicroOCRModel, char_to_index
 from microocr.preprocess import TARGET_HEIGHT
+from training.eval import build_eval_set, evaluate_arrays
 from training.synth_data import generate_batch
 
 
@@ -76,6 +77,8 @@ def train(
     batches_per_epoch: int = 200,
     output_dir: str = "output",
     seed: int = 42,
+    val_samples: int = 256,
+    val_seed: int = 1337,
 ) -> None:
     """Train the MicroOCR model.
 
@@ -86,7 +89,12 @@ def train(
         batches_per_epoch: Number of batches per epoch.
         output_dir: Directory to save model weights.
         seed: Random seed.
+        val_samples: Number of synthetic eval samples.
+        val_seed: RNG seed for deterministic eval set.
     """
+    if val_samples < 1:
+        raise ValueError("val_samples must be >= 1")
+
     rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
@@ -107,7 +115,11 @@ def train(
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    best_loss = float("inf")
+    eval_images, eval_labels = build_eval_set(num_samples=val_samples, seed=val_seed)
+    print(f"Validation set: {val_samples} synthetic samples (seed={val_seed})")
+
+    best_val_cer = float("inf")
+    best_val_word_acc = 0.0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -157,13 +169,24 @@ def train(
             f"lr={optimizer.param_groups[0]['lr']:.6f}"
         )
 
-        scheduler.step(avg_loss)
+        model.eval()
+        val = _evaluate_model(model, eval_images, eval_labels)
+        val_cer = val["cer"]
+        val_word_acc = val["word_acc"]
+        print(f"  val_cer={val_cer:.4f}  val_word_acc={val_word_acc:.4f}")
+
+        scheduler.step(val_cer)
 
         # Save best model
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if val_cer < best_val_cer:
+            best_val_cer = val_cer
+            best_val_word_acc = val_word_acc
             _save_model(model, out_path / "microocr_best.pth")
-            print(f"  -> Saved best model (loss={best_loss:.4f})")
+            _export_npz(model, out_path / "microocr.npz")
+            print(
+                "  -> Saved best model "
+                f"(cer={best_val_cer:.4f}, word_acc={best_val_word_acc:.4f})"
+            )
 
         # Save periodic checkpoint
         if epoch % 10 == 0:
@@ -171,18 +194,30 @@ def train(
 
     # Save final model
     _save_model(model, out_path / "microocr_final.pth")
-
-    # Export to NumPy .npz for inference
-    _export_npz(model, out_path / "microocr.npz")
+    _export_npz(model, out_path / "microocr_final.npz")
+    if not (out_path / "microocr.npz").exists():
+        _export_npz(model, out_path / "microocr.npz")
     print(f"\nTraining complete. Weights saved to {out_path}/")
     print(f"  PyTorch: microocr_final.pth")
-    print(f"  NumPy:   microocr.npz (for inference)")
+    print(f"  NumPy:   microocr.npz (best validation checkpoint)")
+    print(f"  NumPy:   microocr_final.npz (final epoch)")
 
     # Also copy to the package weights directory
     weights_dir = Path(__file__).parent.parent / "microocr" / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
-    _export_npz(model, weights_dir / "microocr.npz")
+    shutil.copy2(out_path / "microocr.npz", weights_dir / "microocr.npz")
     print(f"  Copied to: {weights_dir / 'microocr.npz'}")
+
+
+def _evaluate_model(
+    model: MicroOCRModel,
+    images: list[np.ndarray],
+    labels: list[str],
+) -> dict[str, float]:
+    """Evaluate current model weights with NumPy inference."""
+    state = model.state_dict()
+    weights = {k: v.detach().cpu().numpy() for k, v in state.items()}
+    return evaluate_arrays(weights, images, labels)
 
 
 def _save_model(model: MicroOCRModel, path: Path) -> None:
@@ -215,6 +250,18 @@ def main():
         help="Output directory for weights",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--val-samples",
+        type=int,
+        default=256,
+        help="Number of synthetic validation samples",
+    )
+    parser.add_argument(
+        "--val-seed",
+        type=int,
+        default=1337,
+        help="Validation RNG seed",
+    )
     args = parser.parse_args()
 
     train(
@@ -224,6 +271,8 @@ def main():
         batches_per_epoch=args.batches_per_epoch,
         output_dir=args.output_dir,
         seed=args.seed,
+        val_samples=args.val_samples,
+        val_seed=args.val_seed,
     )
 
 

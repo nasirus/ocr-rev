@@ -150,6 +150,27 @@ class TestPreprocess:
         assert resized.shape[0] == 32
         assert resized.shape[1] == 64  # halved (aspect ratio preserved)
 
+    def test_resize_height_bilinear_mode(self):
+        """Bilinear mode runs and differs from nearest on nontrivial input."""
+        from microocr.preprocess import resize_height
+
+        img = np.tile(np.arange(9, dtype=np.uint8) * 28, (5, 1))
+        nearest = resize_height(img, target_height=11, mode="nearest")
+        bilinear = resize_height(img, target_height=11, mode="bilinear")
+
+        assert nearest.shape == bilinear.shape
+        assert nearest.dtype == np.uint8
+        assert bilinear.dtype == np.uint8
+        assert not np.array_equal(nearest, bilinear)
+
+    def test_resize_height_invalid_mode(self):
+        """Unsupported resize mode raises ValueError."""
+        from microocr.preprocess import resize_height
+
+        img = np.zeros((8, 12), dtype=np.uint8)
+        with pytest.raises(ValueError, match="Unsupported resize mode"):
+            resize_height(img, target_height=16, mode="unknown")
+
     def test_preprocess_pipeline(self):
         """Full pipeline returns correct shape and dtype."""
         from microocr.preprocess import preprocess, TARGET_HEIGHT
@@ -170,6 +191,19 @@ class TestPreprocess:
         result = preprocess(white)
 
         assert result.shape[0] == TARGET_HEIGHT
+
+    def test_preprocess_already_binary(self):
+        """Preprocess supports skipping thresholding when input is already binary."""
+        from microocr.preprocess import preprocess, TARGET_HEIGHT
+
+        binary = np.full((50, 120), 255, dtype=np.uint8)
+        binary[15:35, 20:100] = 0
+        result = preprocess(binary, target_height=TARGET_HEIGHT, already_binary=True)
+
+        assert result.shape[0] == TARGET_HEIGHT
+        assert result.dtype == np.float32
+        assert result.min() <= 0.05
+        assert result.max() >= 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +301,25 @@ class TestCTC:
 
         result = greedy_decode(logits)
         assert result == "aa"
+
+    def test_beam_decode_repeated_with_blank(self):
+        """Beam decode handles repeated characters correctly."""
+        from microocr.ctc import beam_decode, BLANK_IDX
+
+        T = 8
+        C = 63
+        logits = np.full((T, C), -10.0, dtype=np.float32)
+        logits[0, BLANK_IDX] = 10.0
+        logits[1, 33] = 10.0  # H
+        logits[2, 33] = 10.0  # H repeat
+        logits[3, BLANK_IDX] = 10.0
+        logits[4, 8] = 10.0  # i
+        logits[5, 8] = 10.0
+        logits[6, 8] = 10.0
+        logits[7, BLANK_IDX] = 10.0
+
+        result = beam_decode(logits, beam_width=5)
+        assert result == "Hi"
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +422,42 @@ class TestInference:
             f"Shape mismatch: numpy={np_out.shape} vs pytorch={pt_out.shape}"
         )
         np.testing.assert_allclose(np_out, pt_out, atol=1e-4, rtol=1e-4)
+
+    def test_load_weights_cache_respects_path(self):
+        """Loading one path does not mask missing/other paths."""
+        from microocr import inference as inf
+
+        inf._cached_weights.clear()
+        _ = inf._load_weights("microocr/weights/microocr.npz")
+        with pytest.raises(FileNotFoundError):
+            inf._load_weights("does/not/exist.npz")
+
+    def test_blank_image_rejected(self):
+        """All-white image should decode as empty text by default."""
+        import microocr
+
+        img = TestDecode._make_gray_png(200, 80, fill=255)
+        b64 = base64.b64encode(img).decode("ascii")
+        result = microocr.read(b64, weights_path="microocr/weights/microocr.npz")
+        assert result == ""
+
+    def test_read_with_timing_reports_stages(self):
+        """Internal timing helper returns expected stage keys."""
+        from microocr.inference import _read_with_timing
+
+        img = TestDecode._make_gray_png(64, 32, fill=255)
+        b64 = base64.b64encode(img).decode("ascii")
+        _, timing = _read_with_timing(b64, weights_path="microocr/weights/microocr.npz")
+        for key in (
+            "decode_ms",
+            "segment_ms",
+            "preprocess_ms",
+            "forward_ms",
+            "decode_ctc_ms",
+            "total_ms",
+        ):
+            assert key in timing
+            assert timing[key] >= 0.0
 
 
 # ---------------------------------------------------------------------------
