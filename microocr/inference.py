@@ -442,11 +442,11 @@ def _dequantize_int8(weights: dict[str, np.ndarray]) -> None:
 # ---------------------------------------------------------------------------
 
 # The architecture mirrors MicroOCRModel from model.py:
-#   conv1(1→16, 3x3, pad=1) → relu → maxpool(2x2)
-#   conv2(16→32, 3x3, pad=1) → relu → maxpool(2x2)
-#   conv3(32→64, 3x3, pad=1) → relu
-#   conv4(64→64, 3x3, pad=1) → relu + residual(conv3)
-#   reshape → fc1(512→128) → relu → fc2(128→num_classes)
+#   conv1(1→c1, 3x3, pad=1) → relu → maxpool(2x2)
+#   conv2(c1→c2, 3x3, pad=1) → relu → maxpool(2x2)
+#   conv3(c2→c3, 3x3, pad=1) → relu
+#   conv4(c3→c3, 3x3, pad=1) → relu + residual(conv3)
+#   reshape → fc1(c3*8→hidden) → relu → fc2(hidden→num_classes)
 # Note: BN is folded into conv weights at export time, so inference
 # sees only conv.weight and conv.bias (with BN absorbed).
 

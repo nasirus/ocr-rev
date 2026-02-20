@@ -42,57 +42,57 @@ def augment(img: np.ndarray, rng: np.random.Generator | None = None) -> np.ndarr
         rng = np.random.default_rng()
 
     # ── Document-realism augmentations (applied early) ────────────────
-    if rng.random() < 0.20:
+    if rng.random() < 0.15:
         img = paper_texture(img, rng)
 
-    if rng.random() < 0.12:
+    if rng.random() < 0.06:
         img = add_stains(img, rng)
 
-    if rng.random() < 0.15:
+    if rng.random() < 0.08:
         img = scanner_shadow(img, rng)
 
-    if rng.random() < 0.15:
+    if rng.random() < 0.08:
         img = line_artifact(img, rng)
 
     # ── Standard augmentations ────────────────────────────────────────
-    if rng.random() < 0.6:
-        img = add_gaussian_noise(img, rng, sigma_range=(0.01, 0.08))
+    if rng.random() < 0.45:
+        img = add_gaussian_noise(img, rng, sigma_range=(0.005, 0.05))
 
-    if rng.random() < 0.3:
+    if rng.random() < 0.2:
         img = gaussian_blur(img, rng)
 
-    if rng.random() < 0.3:
+    if rng.random() < 0.22:
         img = adjust_brightness(img, rng, delta_range=(-0.15, 0.15))
 
-    if rng.random() < 0.3:
+    if rng.random() < 0.22:
         img = adjust_contrast(img, rng, factor_range=(0.7, 1.3))
 
-    if rng.random() < 0.2:
+    if rng.random() < 0.14:
         img = erode_or_dilate(img, rng)
 
-    if rng.random() < 0.25:
+    if rng.random() < 0.16:
         img = add_illumination_gradient(img, rng)
 
-    if rng.random() < 0.25:
+    if rng.random() < 0.16:
         img = gamma_adjust(img, rng)
 
-    if Image is not None and rng.random() < 0.35:
-        img = random_rotate(img, rng, max_degrees=4.0)
+    if Image is not None and rng.random() < 0.22:
+        img = random_rotate(img, rng, max_degrees=2.5)
 
-    if Image is not None and rng.random() < 0.3:
-        img = random_perspective(img, rng, max_warp_ratio=0.08)
+    if Image is not None and rng.random() < 0.15:
+        img = random_perspective(img, rng, max_warp_ratio=0.05)
 
-    if Image is not None and rng.random() < 0.2:
-        img = jpeg_compress(img, rng, quality_range=(35, 90))
+    if Image is not None and rng.random() < 0.15:
+        img = jpeg_compress(img, rng, quality_range=(50, 95))
 
-    if rng.random() < 0.3:
+    if rng.random() < 0.10:
         img = random_erasing(img, rng)
 
-    if rng.random() < 0.2:
-        img = salt_and_pepper(img, rng, amount=0.01)
+    if rng.random() < 0.08:
+        img = salt_and_pepper(img, rng, amount=0.004)
 
-    if rng.random() < 0.2:
-        img = elastic_distortion(img, rng, alpha=3.0, sigma=0.5)
+    if rng.random() < 0.08:
+        img = elastic_distortion(img, rng, alpha=1.5, sigma=0.8)
 
     return np.clip(img, 0.0, 1.0).astype(np.float32, copy=False)
 
@@ -290,7 +290,7 @@ def jpeg_compress(
 def random_erasing(
     img: np.ndarray,
     rng: np.random.Generator,
-    area_range: tuple[float, float] = (0.02, 0.10),
+    area_range: tuple[float, float] = (0.01, 0.05),
     fill: float | None = None,
 ) -> np.ndarray:
     """Random erasing / cutout augmentation.

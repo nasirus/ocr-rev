@@ -155,6 +155,35 @@ _PHRASE_WORDS = [
 
 _SEPARATORS = [" ", "-", "_", "/", "."]
 _TAIL_PUNCT = ["", "!", "?", ":", ";", "."]
+_CONNECTOR_WORDS = [
+    "and",
+    "or",
+    "but",
+    "if",
+    "when",
+    "while",
+    "because",
+    "for",
+    "with",
+    "without",
+    "from",
+    "into",
+    "over",
+    "under",
+    "to",
+    "of",
+    "in",
+    "on",
+    "by",
+    "as",
+    "that",
+    "we",
+    "you",
+    "they",
+    "it",
+    "lets",
+    "dont",
+]
 
 # ── Realistic document data pools ──────────────────────────────────────
 _FIRST_NAMES = [
@@ -530,21 +559,22 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
     """
     choice = rng.random()
 
-    if choice < 0.12:
+    if choice < 0.08:
         # Standard random alphanumeric
         length = int(rng.integers(min_len, max_len + 1))
-        return "".join(str(rng.choice(_ALNUM_CHARS)) for _ in range(length))
+        text = "".join(str(rng.choice(_ALNUM_CHARS)) for _ in range(length))
+        return _fit_text_length(text, rng, min_len, max_len)
 
-    elif choice < 0.18:
+    if choice < 0.13:
         # CamelCase words
         word = str(rng.choice(_CAMEL_WORDS))
         if rng.random() < 0.3:
             word = word + str(int(rng.integers(0, 100)))
-        return word[:max_len]
+        return _fit_text_length(word, rng, min_len, max_len)
 
-    elif choice < 0.24:
+    if choice < 0.18:
         # Alphanumeric codes (e.g., AB12cd, X7y9Z)
-        length = int(rng.integers(max(min_len, 4), min(max_len + 1, 12)))
+        length = int(rng.integers(max(min_len, 4), min(max_len + 1, 16)))
         code = []
         for _ in range(length):
             pool_choice = rng.random()
@@ -554,94 +584,115 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
                 code.append(str(rng.choice(list(string.digits))))
             else:
                 code.append(str(rng.choice(list(string.ascii_lowercase))))
-        return "".join(code)
+        return _fit_text_length("".join(code), rng, min_len, max_len)
 
-    elif choice < 0.30:
-        # Date strings with realistic separators
-        return _gen_date(rng, max_len)
+    if choice < 0.23:
+        return _fit_text_length(_gen_date(rng, max_len), rng, min_len, max_len)
+    if choice < 0.28:
+        return _fit_text_length(_gen_email(rng, max_len), rng, min_len, max_len)
+    if choice < 0.32:
+        return _fit_text_length(_gen_url_or_path(rng, max_len), rng, min_len, max_len)
+    if choice < 0.36:
+        return _fit_text_length(_gen_address(rng, max_len), rng, min_len, max_len)
+    if choice < 0.40:
+        return _fit_text_length(_gen_phone(rng, max_len), rng, min_len, max_len)
+    if choice < 0.46:
+        return _fit_text_length(_gen_currency(rng, max_len), rng, min_len, max_len)
+    if choice < 0.51:
+        return _fit_text_length(
+            _gen_reference_number(rng, max_len), rng, min_len, max_len
+        )
+    if choice < 0.60:
+        return _fit_text_length(_gen_sentence(rng, max_len), rng, min_len, max_len)
+    if choice < 0.67:
+        return _fit_text_length(_gen_key_value(rng, max_len), rng, min_len, max_len)
+    if choice < 0.72:
+        return _fit_text_length(_gen_measurement(rng, max_len), rng, min_len, max_len)
+    if choice < 0.78:
+        return _fit_text_length(_gen_full_name(rng, max_len), rng, min_len, max_len)
+    if choice < 0.93:
+        # Paragraph-like fragments to better match long-form OCR inputs.
+        return _gen_paragraph_fragment(rng, min_len=min_len, max_len=max_len)
 
-    elif choice < 0.36:
-        # Email addresses
-        return _gen_email(rng, max_len)
-
-    elif choice < 0.41:
-        # URLs and file paths
-        return _gen_url_or_path(rng, max_len)
-
-    elif choice < 0.46:
-        # Street addresses
-        return _gen_address(rng, max_len)
-
-    elif choice < 0.50:
-        # Phone numbers
-        return _gen_phone(rng, max_len)
-
-    elif choice < 0.55:
-        # Currency amounts
-        return _gen_currency(rng, max_len)
-
-    elif choice < 0.60:
-        # Invoice/reference numbers
-        return _gen_reference_number(rng, max_len)
-
-    elif choice < 0.66:
-        # Natural sentence fragments
-        return _gen_sentence(rng, max_len)
-
-    elif choice < 0.72:
-        # Key-value pairs (label: value)
-        return _gen_key_value(rng, max_len)
-
-    elif choice < 0.76:
-        # Measurements with units
-        return _gen_measurement(rng, max_len)
-
-    elif choice < 0.82:
-        # Full name
-        return _gen_full_name(rng, max_len)
-
-    elif choice < 0.90:
-        # Phrase-like strings with explicit spaces and optional separators.
-        n_words = int(rng.integers(2, 9))
-        parts: list[str] = []
-        for _ in range(n_words):
-            if rng.random() < 0.7:
-                token = str(rng.choice(_PHRASE_WORDS))
-            else:
-                token = str(rng.choice(_CAMEL_WORDS))
-            if rng.random() < 0.2:
-                token = token + str(int(rng.integers(0, 100)))
-            parts.append(token)
-
-        # Mostly spaces, sometimes punctuation separators.
-        if rng.random() < 0.8:
-            sep = " "
+    # Rare/special boosted strings
+    length = int(rng.integers(min_len, max_len + 1))
+    text = []
+    for _ in range(length):
+        p = rng.random()
+        if p < 0.35:
+            text.append(str(rng.choice(_RARE_CHARS)))
+        elif p < 0.65 and _SPECIAL_CHARS:
+            text.append(str(rng.choice(_SPECIAL_CHARS)))
+        elif p < 0.75:
+            text.append(_SPACE_CHAR)
         else:
-            sep = str(rng.choice(_SEPARATORS))
-        text = sep.join(parts) + str(rng.choice(_TAIL_PUNCT))
-        if len(text) > max_len:
-            text = text[:max_len].rstrip()
-        # Keep at least one space-focused example in this branch.
-        if " " not in text and len(parts) >= 2:
-            text = " ".join(parts)[:max_len].rstrip()
-        return text or "a b"
+            text.append(str(rng.choice(_COMMON_CHARS)))
+    out = "".join(text).strip()
+    return _fit_text_length(out or "0", rng, min_len, max_len)
 
-    else:
-        # Rare/special boosted strings
-        length = int(rng.integers(min_len, max_len + 1))
-        text = []
-        for _ in range(length):
-            p = rng.random()
-            if p < 0.35:
-                text.append(str(rng.choice(_RARE_CHARS)))
-            elif p < 0.65 and _SPECIAL_CHARS:
-                text.append(str(rng.choice(_SPECIAL_CHARS)))
-            elif p < 0.75:
-                text.append(_SPACE_CHAR)
-            else:
-                text.append(str(rng.choice(_COMMON_CHARS)))
-        out = "".join(text).strip()
-        return out or "0"
+
+def _fit_text_length(
+    text: str,
+    rng: np.random.Generator,
+    min_len: int,
+    max_len: int,
+) -> str:
+    """Normalize generated text to requested length bounds."""
+    filtered = "".join(c for c in text if c in CHARS)
+    filtered = " ".join(filtered.split())
+    if not filtered:
+        filtered = str(rng.choice(_PHRASE_WORDS))
+
+    if len(filtered) > max_len:
+        filtered = filtered[:max_len].rstrip(" ,;:-_/")
+    while len(filtered) < min_len:
+        token = str(rng.choice(_PHRASE_WORDS))
+        if len(filtered) + 1 + len(token) <= max_len:
+            filtered = f"{filtered} {token}" if filtered else token
+        else:
+            break
+    return filtered[:max_len].strip() or "text"
+
+
+def _gen_paragraph_fragment(
+    rng: np.random.Generator,
+    min_len: int,
+    max_len: int,
+) -> str:
+    """Generate paragraph-like text with mostly natural spacing/casing."""
+    low = min(max_len, max(min_len, 14))
+    high = max_len + 1
+    if high <= low:
+        high = low + 1
+    target = int(rng.integers(low, high))
+    parts: list[str] = []
+
+    while len(" ".join(parts)) < target:
+        p = rng.random()
+        if p < 0.68:
+            token = str(rng.choice(_PHRASE_WORDS))
+        elif p < 0.88:
+            token = str(rng.choice(_CONNECTOR_WORDS))
+        else:
+            token = str(rng.choice(_CAMEL_WORDS)).lower()
+
+        if rng.random() < 0.06:
+            token = token + str(int(rng.integers(0, 100)))
+        parts.append(token)
+
+    if len(parts) > 5 and rng.random() < 0.55:
+        comma_idx = int(rng.integers(2, len(parts) - 1))
+        parts[comma_idx] = parts[comma_idx] + ","
+
+    text = " ".join(parts)
+    if rng.random() < 0.45:
+        text = text + "."
+    elif rng.random() < 0.12:
+        text = text + "?"
+
+    if rng.random() < 0.35 and text:
+        text = text[0].upper() + text[1:]
+    return _fit_text_length(text, rng, min_len, max_len)
 
 
 # ── Document-style text generators ────────────────────────────────────
@@ -1033,8 +1084,12 @@ def generate_sample(
     # Generate diverse text
     label = _generate_text(rng, min_len, max_len)
 
-    # Wider font size range — includes very small and larger text
-    font_size = int(rng.integers(*font_size_range))
+    # Keep long labels readable by biasing to smaller fonts for long strings.
+    font_size = _sample_font_size_for_label(
+        len(label),
+        font_size_range=font_size_range,
+        rng=rng,
+    )
 
     # Render text to image (with optional variable kerning)
     use_variable_kerning = rng.random() < 0.3
@@ -1065,6 +1120,29 @@ def generate_sample(
         )
 
     return img_out, label
+
+
+def _sample_font_size_for_label(
+    label_len: int,
+    font_size_range: tuple[int, int],
+    rng: np.random.Generator,
+) -> int:
+    """Sample a font size while controlling extreme line widths."""
+    low, high = font_size_range
+    if high <= low:
+        high = low + 1
+
+    # np.random.integers upper bound is exclusive.
+    if label_len >= 64:
+        high = min(high, 28)
+    elif label_len >= 48:
+        high = min(high, 30)
+    elif label_len >= 36:
+        high = min(high, 33)
+
+    if high <= low:
+        low = max(8, high - 1)
+    return int(rng.integers(low, high))
 
 
 def generate_batch(

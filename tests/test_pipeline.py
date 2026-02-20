@@ -345,7 +345,7 @@ class TestModel:
         assert out.shape == (64 // 4, 2, NUM_CLASSES)  # T=16, B=2, C=num_classes
 
     def test_model_parameter_count(self):
-        """Model has roughly ~100K parameters (including BN)."""
+        """Model has a compact parameter budget suitable for deployment."""
         try:
             import torch
         except ImportError:
@@ -356,7 +356,7 @@ class TestModel:
         model = MicroOCRModel()
         n_params = model.count_parameters()
 
-        assert 50_000 < n_params < 200_000, f"Unexpected param count: {n_params}"
+        assert 100_000 < n_params < 500_000, f"Unexpected param count: {n_params}"
 
 
 # ---------------------------------------------------------------------------

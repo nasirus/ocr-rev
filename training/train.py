@@ -84,6 +84,7 @@ def train(
     val_min_len: int = 2,
     val_max_len: int = 40,
     curriculum: bool = True,
+    entropy_weight: float = 0.0,
 ) -> None:
     """Train the MicroOCR model.
 
@@ -103,6 +104,8 @@ def train(
         curriculum: If True, use curriculum learning — start with shorter/
             easier text and progressively increase max label length and
             font-size range over epochs.
+        entropy_weight: Optional entropy regularization weight. Keep at
+            0.0 for best exact-transcription accuracy on this task.
     """
     if val_samples < 1:
         raise ValueError("val_samples must be >= 1")
@@ -151,9 +154,6 @@ def train(
 
     best_val_cer = float("inf")
     best_val_word_acc = 0.0
-
-    # Entropy regularization weight
-    entropy_weight = 0.01
 
     # Curriculum learning parameters
     cur_start_max_len = max(train_min_len + 2, train_max_len // 3)
@@ -205,10 +205,11 @@ def train(
             # CTC loss
             loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
-            # Entropy regularization: encourage less overconfident predictions
-            probs = log_probs.exp()
-            entropy = -(probs * log_probs).sum(dim=2).mean()
-            loss = loss - entropy_weight * entropy
+            if entropy_weight > 0.0:
+                # Optional entropy regularization
+                probs = log_probs.exp()
+                entropy = -(probs * log_probs).sum(dim=2).mean()
+                loss = loss - entropy_weight * entropy
 
             # Backward pass
             optimizer.zero_grad()
@@ -435,6 +436,12 @@ def main():
         help="Enable curriculum learning (easy-to-hard progression). "
         "Use --no-curriculum to disable.",
     )
+    parser.add_argument(
+        "--entropy-weight",
+        type=float,
+        default=0.0,
+        help="Entropy regularization weight (0 disables it).",
+    )
     args = parser.parse_args()
 
     train(
@@ -451,6 +458,7 @@ def main():
         val_min_len=args.val_min_len,
         val_max_len=args.val_max_len,
         curriculum=args.curriculum,
+        entropy_weight=args.entropy_weight,
     )
 
 
