@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
 from typing import Literal
+import re
 
 import numpy as np
 
@@ -40,6 +41,7 @@ def read(
     weights_path: str | Path | None = None,
     *,
     decode_mode: Literal["greedy", "beam"] = "greedy",
+    case_normalization: Literal["none", "mixed", "lower"] = "none",
     reject_blank: bool = True,
     reject_blank_ratio: float = 0.90,
     reject_nonblank_peak: float = 0.55,
@@ -57,6 +59,10 @@ def read(
         weights_path: Path to ``.npz`` model weights. If None, uses
             the bundled default weights.
         decode_mode: ``"greedy"`` (fast) or ``"beam"`` (more exhaustive).
+        case_normalization: Optional case normalization strategy:
+            - ``"none"``: return model casing as-is
+            - ``"mixed"``: lowercase non-acronym words, keep short all-caps tokens
+            - ``"lower"``: lowercase all output text
         reject_blank: If True, suppress line output when logits indicate
             mostly blank content.
         reject_blank_ratio: Minimum argmax-blank ratio to treat as blank line.
@@ -82,6 +88,7 @@ def read(
         b64_string=b64_string,
         weights_path=weights_path,
         decode_mode=decode_mode,
+        case_normalization=case_normalization,
         reject_blank=reject_blank,
         reject_blank_ratio=reject_blank_ratio,
         reject_nonblank_peak=reject_nonblank_peak,
@@ -99,6 +106,7 @@ def read_file(
     weights_path: str | Path | None = None,
     *,
     decode_mode: Literal["greedy", "beam"] = "greedy",
+    case_normalization: Literal["none", "mixed", "lower"] = "none",
     reject_blank: bool = True,
     reject_blank_ratio: float = 0.90,
     reject_nonblank_peak: float = 0.55,
@@ -131,6 +139,7 @@ def read_file(
         b64,
         weights_path=weights_path,
         decode_mode=decode_mode,
+        case_normalization=case_normalization,
         reject_blank=reject_blank,
         reject_blank_ratio=reject_blank_ratio,
         reject_nonblank_peak=reject_nonblank_peak,
@@ -146,6 +155,7 @@ def _read_with_timing(
     weights_path: str | Path | None = None,
     *,
     decode_mode: Literal["greedy", "beam"] = "greedy",
+    case_normalization: Literal["none", "mixed", "lower"] = "none",
     reject_blank: bool = True,
     reject_blank_ratio: float = 0.90,
     reject_nonblank_peak: float = 0.55,
@@ -159,6 +169,7 @@ def _read_with_timing(
         b64_string=b64_string,
         weights_path=weights_path,
         decode_mode=decode_mode,
+        case_normalization=case_normalization,
         reject_blank=reject_blank,
         reject_blank_ratio=reject_blank_ratio,
         reject_nonblank_peak=reject_nonblank_peak,
@@ -177,6 +188,7 @@ def _read_impl(
     weights_path: str | Path | None,
     *,
     decode_mode: Literal["greedy", "beam"],
+    case_normalization: Literal["none", "mixed", "lower"],
     reject_blank: bool,
     reject_blank_ratio: float,
     reject_nonblank_peak: float,
@@ -188,6 +200,8 @@ def _read_impl(
 ) -> tuple[str, dict[str, float] | None]:
     if decode_mode not in ("greedy", "beam"):
         raise ValueError(f"Unsupported decode mode: {decode_mode}")
+    if case_normalization not in ("none", "mixed", "lower"):
+        raise ValueError(f"Unsupported case_normalization: {case_normalization}")
     if beam_width < 1:
         raise ValueError("beam_width must be >= 1")
     if max_line_width is not None and max_line_width < 1:
@@ -254,9 +268,33 @@ def _read_impl(
             results.append(text)
 
     out = "\n".join(results)
+    out = _normalize_case_text(out, mode=case_normalization)
     if timings is not None:
         timings["total_ms"] = (perf_counter() - total_start) * 1000.0
     return out, timings
+
+
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _normalize_case_text(
+    text: str,
+    mode: Literal["none", "mixed", "lower"],
+) -> str:
+    """Normalize output casing for noisy mixed-case OCR outputs."""
+    if mode == "none":
+        return text
+    if mode == "lower":
+        return text.lower()
+
+    def _convert(match: re.Match[str]) -> str:
+        word = match.group(0)
+        if word.isupper() and 2 <= len(word) <= 5:
+            # Keep short acronyms like OCR, API, HTTP.
+            return word
+        return word.lower()
+
+    return _WORD_RE.sub(_convert, text)
 
 
 def _accum_ms(

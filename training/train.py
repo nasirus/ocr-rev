@@ -80,9 +80,9 @@ def train(
     val_samples: int = 256,
     val_seed: int = 1337,
     train_min_len: int = 2,
-    train_max_len: int = 32,
+    train_max_len: int = 112,
     val_min_len: int = 2,
-    val_max_len: int = 40,
+    val_max_len: int = 120,
     curriculum: bool = True,
     entropy_weight: float = 0.0,
 ) -> None:
@@ -421,13 +421,13 @@ def main():
         "--train-min-len", type=int, default=2, help="Training min label length"
     )
     parser.add_argument(
-        "--train-max-len", type=int, default=32, help="Training max label length"
+        "--train-max-len", type=int, default=112, help="Training max label length"
     )
     parser.add_argument(
         "--val-min-len", type=int, default=2, help="Validation min label length"
     )
     parser.add_argument(
-        "--val-max-len", type=int, default=40, help="Validation max label length"
+        "--val-max-len", type=int, default=120, help="Validation max label length"
     )
     parser.add_argument(
         "--curriculum",

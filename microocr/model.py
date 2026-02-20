@@ -7,7 +7,7 @@ Architecture:
     Input:  (B, 1, 32, W)   — batch of grayscale line images
     Output: (T, B, n_class)  — per-timestep class logits for CTC
 
-Total parameters: ~290K  (~1.1MB float32, ~280KB int8)
+Total parameters: ~925K  (~3.6MB float32, ~0.9MB int8)
 """
 
 from __future__ import annotations
@@ -54,8 +54,8 @@ class MicroOCRModel(nn.Module):
     def __init__(
         self,
         num_classes: int = NUM_CLASSES,
-        base_channels: int = 24,
-        head_hidden: int = 192,
+        base_channels: int = 40,
+        head_hidden: int = 384,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -77,7 +77,7 @@ class MicroOCRModel(nn.Module):
 
         self.pool = nn.MaxPool2d(2, 2)
         self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(p=0.15)
+        self.dropout = nn.Dropout(p=0.2)
 
         # After conv4: (B, c3, 8, W/4)
         # Collapse height: reshape to (B, W/4, c3*8) = (B, T, c3*8)

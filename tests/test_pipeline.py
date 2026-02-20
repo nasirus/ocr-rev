@@ -356,7 +356,7 @@ class TestModel:
         model = MicroOCRModel()
         n_params = model.count_parameters()
 
-        assert 100_000 < n_params < 500_000, f"Unexpected param count: {n_params}"
+        assert 700_000 < n_params < 1_500_000, f"Unexpected param count: {n_params}"
 
 
 # ---------------------------------------------------------------------------

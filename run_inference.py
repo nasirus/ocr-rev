@@ -83,6 +83,7 @@ def main():
             weights_path=str(weights),
             decode_mode="beam",
             beam_width=12,
+            case_normalization="mixed",
         )
         print(f"\nRecognized text:\n{result}")
     else:
@@ -94,6 +95,7 @@ def main():
             weights_path=str(weights),
             decode_mode="beam",
             beam_width=12,
+            case_normalization="mixed",
         )
         print(f"\nRecognized text: '{result}'")
         print(f"Expected text:   '{expected}'")

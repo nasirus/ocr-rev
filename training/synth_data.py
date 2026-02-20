@@ -610,7 +610,7 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
         return _fit_text_length(_gen_measurement(rng, max_len), rng, min_len, max_len)
     if choice < 0.78:
         return _fit_text_length(_gen_full_name(rng, max_len), rng, min_len, max_len)
-    if choice < 0.93:
+    if choice < 0.96:
         # Paragraph-like fragments to better match long-form OCR inputs.
         return _gen_paragraph_fragment(rng, min_len=min_len, max_len=max_len)
 
@@ -661,6 +661,10 @@ def _gen_paragraph_fragment(
 ) -> str:
     """Generate paragraph-like text with mostly natural spacing/casing."""
     low = min(max_len, max(min_len, 14))
+    if max_len >= 96:
+        low = max(low, int(max_len * 0.55))
+    elif max_len >= 72:
+        low = max(low, int(max_len * 0.45))
     high = max_len + 1
     if high <= low:
         high = low + 1
@@ -1133,7 +1137,13 @@ def _sample_font_size_for_label(
         high = low + 1
 
     # np.random.integers upper bound is exclusive.
-    if label_len >= 64:
+    if label_len >= 110:
+        high = min(high, 22)
+    elif label_len >= 96:
+        high = min(high, 24)
+    elif label_len >= 80:
+        high = min(high, 26)
+    elif label_len >= 64:
         high = min(high, 28)
     elif label_len >= 48:
         high = min(high, 30)
@@ -1141,7 +1151,7 @@ def _sample_font_size_for_label(
         high = min(high, 33)
 
     if high <= low:
-        low = max(8, high - 1)
+        low = max(8, high - 2)
     return int(rng.integers(low, high))
 
 

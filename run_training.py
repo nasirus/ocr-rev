@@ -13,7 +13,7 @@ from training.train import train
 if __name__ == "__main__":
     train(
         epochs=100,
-        batch_size=24,
+        batch_size=16,
         lr=0.0006,
         batches_per_epoch=200,
         output_dir="output",
@@ -21,8 +21,8 @@ if __name__ == "__main__":
         val_samples=384,
         val_seed=1337,
         train_min_len=2,
-        train_max_len=64,
+        train_max_len=112,
         val_min_len=2,
-        val_max_len=72,
+        val_max_len=120,
         curriculum=True,
     )
