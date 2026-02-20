@@ -1,7 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "ocr-rev"
+name = "microocr"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight OCR engine: base64 image to text tokens. Runs on phones and browsers."
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.0",
+    "pillow>=9.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pillow>=9.0",
+]
+
+[tool.setuptools]
+packages = ["microocr", "training"]
