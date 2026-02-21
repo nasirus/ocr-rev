@@ -12,13 +12,13 @@ from training.train import train
 
 if __name__ == "__main__":
     train(
-        epochs=80,
-        batch_size=16,
-        lr=0.0006,
-        batches_per_epoch=200,
+        epochs=150,
+        batch_size=32,
+        lr=0.0008,
+        batches_per_epoch=300,
         output_dir="output",
         seed=42,
-        val_samples=384,
+        val_samples=512,
         val_seed=1337,
         train_min_len=2,
         train_max_len=112,

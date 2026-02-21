@@ -503,6 +503,37 @@ _ADVERBS = [
 ]
 
 # Key-value label patterns found in forms/documents
+# Words with commonly confused character pairs for targeted training
+_CONFUSION_WORDS = [
+    # p/d/b/q heavy
+    "deploy", "depend", "adapt", "display", "upload", "develop", "rapid",
+    "deep", "pad", "dip", "drop", "drape", "typed", "python", "php",
+    "pandas", "dedup", "paddle", "stopped", "bumped", "probed", "grabbed",
+    "popped", "mapped", "dripped", "wrapped", "deposit", "republic",
+    "backdrop", "doorstep", "endpoint", "dropbox", "blueprint",
+    # g/c/q heavy
+    "graphic", "magic", "garage", "logic", "organic", "gigantic", "cargo",
+    "recognize", "glycogen", "changing", "charging", "engaging", "packaging",
+    "configuring", "debugging", "queuing", "conquering", "collaging",
+    # l/i/1 heavy
+    "illegal", "illicit", "initial", "install", "literal", "inline",
+    "pill", "fill", "bill", "still", "skill", "llm", "dll", "all",
+    "tall", "wall", "hall", "illustrate", "illumination", "illusion",
+    "liability", "lollipop", "parallel", "milliliter", "vanilla",
+    # j/i heavy
+    "jinja", "jit", "fiji", "hijack", "jigsaw", "majin",
+    # y/v heavy
+    "every", "heavy", "survey", "valley", "voyage", "very", "ivy",
+    "savvy", "levy", "navy", "wavy", "victory", "variety",
+    # double letters (CTC challenge)
+    "balloon", "coffee", "committee", "assess", "parallel", "broccoli",
+    "accommodate", "announce", "approve", "arrange", "arrived",
+    "occurred", "succeed", "suppress", "tomorrow", "possess",
+    "misspell", "millennium", "bookkeeper", "successfully",
+    # comma/period disambiguation
+    "e.g.", "i.e.", "Dr.", "Mr.", "Ms.", "etc.", "vs.", "approx.",
+]
+
 _FIELD_LABELS = [
     "Name",
     "Date",
@@ -610,9 +641,12 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
         return _fit_text_length(_gen_measurement(rng, max_len), rng, min_len, max_len)
     if choice < 0.78:
         return _fit_text_length(_gen_full_name(rng, max_len), rng, min_len, max_len)
-    if choice < 0.96:
+    if choice < 0.85:
         # Paragraph-like fragments to better match long-form OCR inputs.
         return _gen_paragraph_fragment(rng, min_len=min_len, max_len=max_len)
+    if choice < 0.96:
+        # Confusion-pair enriched text for commonly confused characters
+        return _gen_confusion_pair_text(rng, min_len=min_len, max_len=max_len)
 
     # Rare/special boosted strings
     length = int(rng.integers(min_len, max_len + 1))
@@ -1054,6 +1088,64 @@ def _gen_full_name(rng: np.random.Generator, max_len: int) -> str:
 
     text = "".join(c for c in text if c in CHARS)
     return text[:max_len]
+
+
+def _gen_confusion_pair_text(
+    rng: np.random.Generator, min_len: int, max_len: int
+) -> str:
+    """Generate text enriched with commonly confused character groups.
+
+    Focuses on p/d/b/q, g/c/q, l/i/j, y/v, double letters, and punctuation
+    to train the model on visually similar characters.
+    """
+    style = int(rng.integers(0, 4))
+
+    if style == 0:
+        # String of confusion words joined with spaces
+        n_words = int(rng.integers(2, 8))
+        words = [str(rng.choice(_CONFUSION_WORDS)) for _ in range(n_words)]
+        text = " ".join(words)
+    elif style == 1:
+        # Mix confusion words with connectors for natural flow
+        parts: list[str] = []
+        n_words = int(rng.integers(3, 10))
+        for i in range(n_words):
+            if i > 0 and rng.random() < 0.35:
+                parts.append(str(rng.choice(_CONNECTOR_WORDS)))
+            parts.append(str(rng.choice(_CONFUSION_WORDS)))
+        text = " ".join(parts)
+        if rng.random() < 0.4:
+            # Insert commas for punctuation training
+            if len(parts) > 3:
+                idx = int(rng.integers(2, len(parts) - 1))
+                parts[idx] = parts[idx] + ","
+            text = " ".join(parts)
+    elif style == 2:
+        # Confusion chars mixed with sentence fragments
+        noun = str(rng.choice(_NOUNS))
+        verb = str(rng.choice(_VERBS))
+        cword1 = str(rng.choice(_CONFUSION_WORDS))
+        cword2 = str(rng.choice(_CONFUSION_WORDS))
+        templates = [
+            f"the {noun} {verb} {cword1} and {cword2}",
+            f"{cword1}, {cword2}: {noun} {verb}",
+            f"please {verb} the {cword1} for {cword2}.",
+            f"{cword1} is {verb} by {cword2}, not {noun}.",
+        ]
+        text = str(rng.choice(templates))
+    else:
+        # Punctuation-heavy text with commas and periods
+        words = [str(rng.choice(_CONFUSION_WORDS)) for _ in range(int(rng.integers(3, 7)))]
+        punct_templates = [
+            f"{words[0]}, {words[1]}. {words[2]}",
+            f"e.g., {words[0]}; i.e., {words[1]}",
+            f"Dr. {str(rng.choice(_FIRST_NAMES))}, {words[0]} dept.",
+            f"{words[0]}: {words[1]}, {words[2]}.",
+        ]
+        text = str(rng.choice(punct_templates))
+
+    text = "".join(c for c in text if c in CHARS)
+    return _fit_text_length(text, rng, min_len, max_len)
 
 
 def generate_sample(

@@ -432,6 +432,12 @@ def _load_weights(path: str | Path | None = None) -> dict[str, np.ndarray]:
                     weights[fc_name].T.astype(np.float32, copy=False)
                 )
 
+        # Pre-transpose GRU weights for efficient matrix-vector products
+        for rnn_key in [k for k in list(weights) if k.startswith("rnn.weight_")]:
+            weights[rnn_key + "_T"] = np.ascontiguousarray(
+                weights[rnn_key].T.astype(np.float32, copy=False)
+            )
+
     _validate_class_count(weights, resolved)
 
     _cached_weights[resolved] = weights
@@ -484,13 +490,13 @@ def _dequantize_int8(weights: dict[str, np.ndarray]) -> None:
 #   conv2(c1→c2, 3x3, pad=1) → relu → maxpool(2x2)
 #   conv3(c2→c3, 3x3, pad=1) → relu
 #   conv4(c3→c3, 3x3, pad=1) → relu + residual(conv3)
-#   reshape → fc1(c3*8→hidden) → relu → fc2(hidden→num_classes)
+#   reshape → BiGRU → fc1 → relu → fc2
 # Note: BN is folded into conv weights at export time, so inference
 # sees only conv.weight and conv.bias (with BN absorbed).
 
 
 def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
-    """Run the CNN forward pass in pure NumPy.
+    """Run the CNN + BiGRU forward pass in pure NumPy.
 
     Args:
         img: 2-D float32 array (H, W) normalized to [0, 1].
@@ -502,6 +508,7 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
     # Detect architecture version: residual connection is used when
     # "arch_version" key is present (set by new export code).
     use_residual = "arch_version" in weights
+    use_rnn = "rnn.weight_ih_l0" in weights
 
     # Add batch and channel dims: (H, W) → (1, 1, H, W)
     x = img[np.newaxis, np.newaxis, :, :].astype(np.float32, copy=False)
@@ -527,10 +534,15 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
     else:
         x = _relu(x)
 
-    # Reshape: (1, 64, 8, T) → (1, T, 512)
+    # Collapse height: (1, C, H', T) → (T, C*H')
     b, c, h, w = x.shape
-    x = np.transpose(x, (0, 3, 1, 2))  # (1, T, 64, 8)
-    x = x.reshape(b, w, c * h)  # (1, T, 512)
+    x = np.transpose(x, (0, 3, 1, 2))  # (1, T, C, H')
+    x = x.reshape(b, w, c * h)  # (1, T, C*H')
+
+    # BiGRU for sequential context (if weights present)
+    if use_rnn:
+        x = _bigru_forward(x[0], weights)  # (T, 2*hidden)
+        x = x[np.newaxis, :, :]  # (1, T, 2*hidden)
 
     # FC1 — use pre-transposed weight if available
     if "fc1.weight_T" in weights:
@@ -547,6 +559,112 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
 
     # Remove batch dim: (1, T, C) → (T, C)
     return x[0]
+
+
+# ---------------------------------------------------------------------------
+# BiGRU (pure NumPy)
+# ---------------------------------------------------------------------------
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid."""
+    return np.where(
+        x >= 0,
+        1.0 / (1.0 + np.exp(-x)),
+        np.exp(x) / (1.0 + np.exp(x)),
+    )
+
+
+def _gru_cell(
+    x_t: np.ndarray,
+    h_prev: np.ndarray,
+    W_ih: np.ndarray,
+    W_hh: np.ndarray,
+    b_ih: np.ndarray,
+    b_hh: np.ndarray,
+) -> np.ndarray:
+    """Single GRU cell step.
+
+    PyTorch GRU stores weights as [3*hidden, input] with gate order: r, z, n.
+
+    Args:
+        x_t: Input at timestep t, shape (input_dim,).
+        h_prev: Previous hidden state, shape (hidden,).
+        W_ih: Input-hidden weight, pre-transposed to (input_dim, 3*hidden).
+        W_hh: Hidden-hidden weight, pre-transposed to (hidden, 3*hidden).
+        b_ih: Input-hidden bias, shape (3*hidden,).
+        b_hh: Hidden-hidden bias, shape (3*hidden,).
+
+    Returns:
+        New hidden state, shape (hidden,).
+    """
+    hidden = h_prev.shape[0]
+
+    # Compute all gates at once: x @ W_ih_T + b_ih  and  h @ W_hh_T + b_hh
+    gates_x = x_t @ W_ih + b_ih  # (3*hidden,)
+    gates_h = h_prev @ W_hh + b_hh  # (3*hidden,)
+
+    # Split into reset, update, new gates
+    r_x, z_x, n_x = gates_x[:hidden], gates_x[hidden:2*hidden], gates_x[2*hidden:]
+    r_h, z_h, n_h = gates_h[:hidden], gates_h[hidden:2*hidden], gates_h[2*hidden:]
+
+    r = _sigmoid(r_x + r_h)        # reset gate
+    z = _sigmoid(z_x + z_h)        # update gate
+    n = np.tanh(n_x + r * n_h)     # new gate
+
+    h_new = (1.0 - z) * n + z * h_prev
+    return h_new.astype(np.float32, copy=False)
+
+
+def _bigru_forward(
+    seq: np.ndarray,
+    weights: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Run BiGRU over a sequence.
+
+    Args:
+        seq: Input sequence, shape (T, input_dim).
+        weights: Model weights dict (must contain rnn.* keys).
+
+    Returns:
+        Output sequence, shape (T, 2*hidden).
+    """
+    T = seq.shape[0]
+
+    # Use pre-transposed weights if available, otherwise transpose on the fly
+    def _get_w(name: str) -> np.ndarray:
+        t_name = name + "_T"
+        if t_name in weights:
+            return weights[t_name]
+        return weights[name].T
+
+    W_ih_fwd = _get_w("rnn.weight_ih_l0")
+    W_hh_fwd = _get_w("rnn.weight_hh_l0")
+    b_ih_fwd = weights["rnn.bias_ih_l0"]
+    b_hh_fwd = weights["rnn.bias_hh_l0"]
+
+    W_ih_bwd = _get_w("rnn.weight_ih_l0_reverse")
+    W_hh_bwd = _get_w("rnn.weight_hh_l0_reverse")
+    b_ih_bwd = weights["rnn.bias_ih_l0_reverse"]
+    b_hh_bwd = weights["rnn.bias_hh_l0_reverse"]
+
+    hidden = b_ih_fwd.shape[0] // 3
+
+    # Forward direction
+    h_fwd = np.zeros(hidden, dtype=np.float32)
+    fwd_out = np.empty((T, hidden), dtype=np.float32)
+    for t in range(T):
+        h_fwd = _gru_cell(seq[t], h_fwd, W_ih_fwd, W_hh_fwd, b_ih_fwd, b_hh_fwd)
+        fwd_out[t] = h_fwd
+
+    # Reverse direction
+    h_bwd = np.zeros(hidden, dtype=np.float32)
+    bwd_out = np.empty((T, hidden), dtype=np.float32)
+    for t in range(T - 1, -1, -1):
+        h_bwd = _gru_cell(seq[t], h_bwd, W_ih_bwd, W_hh_bwd, b_ih_bwd, b_hh_bwd)
+        bwd_out[t] = h_bwd
+
+    return np.concatenate([fwd_out, bwd_out], axis=1)  # (T, 2*hidden)
 
 
 # ---------------------------------------------------------------------------

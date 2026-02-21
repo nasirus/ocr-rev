@@ -216,7 +216,7 @@ def train(
             loss.backward()
 
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
 
             optimizer.step()
             scheduler.step()
@@ -322,6 +322,11 @@ def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
     for key in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"):
         result[key] = state[key].cpu().numpy().astype(np.float32)
 
+    # Copy RNN (BiGRU) weights if present
+    for key in state:
+        if key.startswith("rnn."):
+            result[key] = state[key].cpu().numpy().astype(np.float32)
+
     return result
 
 
@@ -344,8 +349,8 @@ def _export_npz(
     """
     arrays = fold_bn_into_conv(model)
 
-    # Architecture version marker: enables residual connection in inference
-    arrays["arch_version"] = np.array([2], dtype=np.int32)
+    # Architecture version marker: v3 = residual + BiGRU
+    arrays["arch_version"] = np.array([3], dtype=np.int32)
 
     if quantize_int8:
         arrays = _quantize_weights_int8(arrays)

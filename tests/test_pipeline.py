@@ -356,7 +356,7 @@ class TestModel:
         model = MicroOCRModel()
         n_params = model.count_parameters()
 
-        assert 700_000 < n_params < 1_500_000, f"Unexpected param count: {n_params}"
+        assert 1_000_000 < n_params < 2_000_000, f"Unexpected param count: {n_params}"
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ class TestInference:
         assert out.shape == (1, 16, 16, 32)
 
     def test_numpy_matches_pytorch(self):
-        """NumPy forward pass (with BN folding) matches PyTorch forward pass."""
+        """NumPy forward pass (with BN folding + BiGRU) matches PyTorch forward pass."""
         try:
             import torch
         except ImportError:
@@ -407,8 +407,8 @@ class TestInference:
 
         # Fold BN into conv weights for NumPy inference
         weights = fold_bn_into_conv(model)
-        # Add arch_version to enable residual connection in inference
-        weights["arch_version"] = np.array([2], dtype=np.int32)
+        # Add arch_version to enable residual + BiGRU in inference
+        weights["arch_version"] = np.array([3], dtype=np.int32)
 
         # Create test input
         rng = np.random.default_rng(42)
@@ -620,8 +620,8 @@ class TestBNFold:
 
         # Fold BN into conv weights
         folded_weights = fold_bn_into_conv(model)
-        # Add arch_version to enable residual connection in inference
-        folded_weights["arch_version"] = np.array([2], dtype=np.int32)
+        # Add arch_version to enable residual + BiGRU in inference
+        folded_weights["arch_version"] = np.array([3], dtype=np.int32)
 
         # Test input
         rng = np.random.default_rng(42)
@@ -638,10 +638,10 @@ class TestBNFold:
 
         assert np_out.shape == pt_out.shape
         max_diff = np.max(np.abs(np_out - pt_out))
-        assert max_diff < 1e-5, f"BN fold max diff = {max_diff}"
+        assert max_diff < 1e-4, f"BN fold max diff = {max_diff}"
 
     def test_bn_fold_key_names(self):
-        """Folded weights have standard conv key names."""
+        """Folded weights have standard conv + RNN key names."""
         try:
             import torch
         except ImportError:
@@ -660,6 +660,11 @@ class TestBNFold:
             "conv4.weight", "conv4.bias",
             "fc1.weight", "fc1.bias",
             "fc2.weight", "fc2.bias",
+            # BiGRU weights
+            "rnn.weight_ih_l0", "rnn.weight_hh_l0",
+            "rnn.bias_ih_l0", "rnn.bias_hh_l0",
+            "rnn.weight_ih_l0_reverse", "rnn.weight_hh_l0_reverse",
+            "rnn.bias_ih_l0_reverse", "rnn.bias_hh_l0_reverse",
         }
         assert set(folded.keys()) == expected_keys
 
