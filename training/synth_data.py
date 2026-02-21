@@ -506,32 +506,150 @@ _ADVERBS = [
 # Words with commonly confused character pairs for targeted training
 _CONFUSION_WORDS = [
     # p/d/b/q heavy
-    "deploy", "depend", "adapt", "display", "upload", "develop", "rapid",
-    "deep", "pad", "dip", "drop", "drape", "typed", "python", "php",
-    "pandas", "dedup", "paddle", "stopped", "bumped", "probed", "grabbed",
-    "popped", "mapped", "dripped", "wrapped", "deposit", "republic",
-    "backdrop", "doorstep", "endpoint", "dropbox", "blueprint",
+    "deploy",
+    "depend",
+    "adapt",
+    "display",
+    "upload",
+    "develop",
+    "rapid",
+    "deep",
+    "pad",
+    "dip",
+    "drop",
+    "drape",
+    "typed",
+    "python",
+    "php",
+    "pandas",
+    "dedup",
+    "paddle",
+    "stopped",
+    "bumped",
+    "probed",
+    "grabbed",
+    "popped",
+    "mapped",
+    "dripped",
+    "wrapped",
+    "deposit",
+    "republic",
+    "backdrop",
+    "doorstep",
+    "endpoint",
+    "dropbox",
+    "blueprint",
     # g/c/q heavy
-    "graphic", "magic", "garage", "logic", "organic", "gigantic", "cargo",
-    "recognize", "glycogen", "changing", "charging", "engaging", "packaging",
-    "configuring", "debugging", "queuing", "conquering", "collaging",
+    "graphic",
+    "magic",
+    "garage",
+    "logic",
+    "organic",
+    "gigantic",
+    "cargo",
+    "recognize",
+    "glycogen",
+    "changing",
+    "charging",
+    "engaging",
+    "packaging",
+    "configuring",
+    "debugging",
+    "queuing",
+    "conquering",
+    "collaging",
     # l/i/1 heavy
-    "illegal", "illicit", "initial", "install", "literal", "inline",
-    "pill", "fill", "bill", "still", "skill", "llm", "dll", "all",
-    "tall", "wall", "hall", "illustrate", "illumination", "illusion",
-    "liability", "lollipop", "parallel", "milliliter", "vanilla",
+    "illegal",
+    "illicit",
+    "initial",
+    "install",
+    "literal",
+    "inline",
+    "pill",
+    "fill",
+    "bill",
+    "still",
+    "skill",
+    "llm",
+    "dll",
+    "all",
+    "tall",
+    "wall",
+    "hall",
+    "illustrate",
+    "illumination",
+    "illusion",
+    "liability",
+    "lollipop",
+    "parallel",
+    "milliliter",
+    "vanilla",
     # j/i heavy
-    "jinja", "jit", "fiji", "hijack", "jigsaw", "majin",
+    "jinja",
+    "jit",
+    "fiji",
+    "hijack",
+    "jigsaw",
+    "majin",
     # y/v heavy
-    "every", "heavy", "survey", "valley", "voyage", "very", "ivy",
-    "savvy", "levy", "navy", "wavy", "victory", "variety",
+    "every",
+    "heavy",
+    "survey",
+    "valley",
+    "voyage",
+    "very",
+    "ivy",
+    "savvy",
+    "levy",
+    "navy",
+    "wavy",
+    "victory",
+    "variety",
     # double letters (CTC challenge)
-    "balloon", "coffee", "committee", "assess", "parallel", "broccoli",
-    "accommodate", "announce", "approve", "arrange", "arrived",
-    "occurred", "succeed", "suppress", "tomorrow", "possess",
-    "misspell", "millennium", "bookkeeper", "successfully",
+    "balloon",
+    "coffee",
+    "committee",
+    "assess",
+    "parallel",
+    "broccoli",
+    "accommodate",
+    "announce",
+    "approve",
+    "arrange",
+    "arrived",
+    "occurred",
+    "succeed",
+    "suppress",
+    "tomorrow",
+    "possess",
+    "misspell",
+    "millennium",
+    "bookkeeper",
+    "successfully",
     # comma/period disambiguation
-    "e.g.", "i.e.", "Dr.", "Mr.", "Ms.", "etc.", "vs.", "approx.",
+    "e.g.",
+    "i.e.",
+    "Dr.",
+    "Mr.",
+    "Ms.",
+    "etc.",
+    "vs.",
+    "approx.",
+    # apostrophe-containing words (CTC + punctuation challenge)
+    "let's",
+    "don't",
+    "it's",
+    "can't",
+    "won't",
+    "I'm",
+    "they're",
+    "we're",
+    "you're",
+    "he's",
+    "she's",
+    "that's",
+    "there's",
+    "what's",
 ]
 
 _FIELD_LABELS = [
@@ -641,7 +759,7 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
         return _fit_text_length(_gen_measurement(rng, max_len), rng, min_len, max_len)
     if choice < 0.78:
         return _fit_text_length(_gen_full_name(rng, max_len), rng, min_len, max_len)
-    if choice < 0.85:
+    if choice < 0.82:
         # Paragraph-like fragments to better match long-form OCR inputs.
         return _gen_paragraph_fragment(rng, min_len=min_len, max_len=max_len)
     if choice < 0.96:
@@ -815,8 +933,8 @@ def _gen_address(rng: np.random.Generator, max_len: int) -> str:
     num = int(rng.integers(1, 9999))
     street = str(rng.choice(_STREET_NAMES))
     suffix = str(rng.choice(_STREET_SUFFIXES))
+    style = int(rng.integers(0, 5))
 
-    style = int(rng.integers(0, 4))
     if style == 0:
         # Full street address
         text = f"{num} {street} {suffix}"
@@ -1133,14 +1251,33 @@ def _gen_confusion_pair_text(
             f"{cword1} is {verb} by {cword2}, not {noun}.",
         ]
         text = str(rng.choice(templates))
-    else:
+    elif style == 3:
         # Punctuation-heavy text with commas and periods
-        words = [str(rng.choice(_CONFUSION_WORDS)) for _ in range(int(rng.integers(3, 7)))]
+        words = [
+            str(rng.choice(_CONFUSION_WORDS)) for _ in range(int(rng.integers(3, 7)))
+        ]
         punct_templates = [
             f"{words[0]}, {words[1]}. {words[2]}",
             f"e.g., {words[0]}; i.e., {words[1]}",
             f"Dr. {str(rng.choice(_FIRST_NAMES))}, {words[0]} dept.",
             f"{words[0]}: {words[1]}, {words[2]}.",
+        ]
+        text = str(rng.choice(punct_templates))
+    else:
+        # Style 4: Comma vs period + apostrophe disambiguation
+        apostrophe_words = [w for w in _CONFUSION_WORDS if "'" in w]
+        if not apostrophe_words:
+            apostrophe_words = ["let's", "don't", "it's"]
+        cwords = [
+            str(rng.choice(_CONFUSION_WORDS)) for _ in range(int(rng.integers(2, 5)))
+        ]
+        aword = str(rng.choice(apostrophe_words))
+        punct_templates = [
+            f"{aword}, {cwords[0]}. {cwords[1]}",
+            f"{cwords[0]}, {aword}; {cwords[1]}.",
+            f"i.e., {aword} and {cwords[0]}, not {cwords[1]}.",
+            f"{aword}: {cwords[0]}, e.g., {cwords[1]}.",
+            f"Note: {aword}, {cwords[0]}. See also {cwords[1]}.",
         ]
         text = str(rng.choice(punct_templates))
 

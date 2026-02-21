@@ -488,9 +488,9 @@ def _dequantize_int8(weights: dict[str, np.ndarray]) -> None:
 # The architecture mirrors MicroOCRModel from model.py:
 #   conv1(1→c1, 3x3, pad=1) → relu → maxpool(2x2)
 #   conv2(c1→c2, 3x3, pad=1) → relu → maxpool(2x2)
-#   conv3(c2→c3, 3x3, pad=1) → relu
+#   conv3(c2→c3, 3x3, pad=1) → relu + proj_res(c2→c3, 1x1) residual [v4]
 #   conv4(c3→c3, 3x3, pad=1) → relu + residual(conv3)
-#   reshape → BiGRU → fc1 → relu → fc2
+#   reshape → multi-layer BiGRU → fc1 → relu → fc2
 # Note: BN is folded into conv weights at export time, so inference
 # sees only conv.weight and conv.bias (with BN absorbed).
 
@@ -505,9 +505,12 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
     Returns:
         2-D array of shape (T, num_classes) — logits per timestep.
     """
-    # Detect architecture version: residual connection is used when
-    # "arch_version" key is present (set by new export code).
-    use_residual = "arch_version" in weights
+    # Detect architecture version
+    arch_version = 0
+    if "arch_version" in weights:
+        arch_version = int(weights["arch_version"][0])
+    use_residual = arch_version >= 3
+    use_proj_res = arch_version >= 4 and "proj_res.weight" in weights
     use_rnn = "rnn.weight_ih_l0" in weights
 
     # Add batch and channel dims: (H, W) → (1, 1, H, W)
@@ -522,10 +525,19 @@ def _forward(img: np.ndarray, weights: dict[str, np.ndarray]) -> np.ndarray:
     x = _conv2d(x, weights["conv2.weight"], weights["conv2.bias"], padding=1)
     x = _relu(x)
     x = _maxpool2d(x, 2)
+    x2 = x  # save for projected residual (v4)
 
     # Conv block 3
     x = _conv2d(x, weights["conv3.weight"], weights["conv3.bias"], padding=1)
-    x3 = _relu(x)
+
+    if use_proj_res:
+        # v4: 1x1 projected residual from conv2 output to conv3 output
+        x2_proj = _conv2d(
+            x2, weights["proj_res.weight"], weights["proj_res.bias"], padding=0
+        )
+        x3 = _relu(x + x2_proj)
+    else:
+        x3 = _relu(x)
 
     # Conv block 4, with optional residual from conv3
     x = _conv2d(x3, weights["conv4.weight"], weights["conv4.bias"], padding=1)
@@ -605,12 +617,20 @@ def _gru_cell(
     gates_h = h_prev @ W_hh + b_hh  # (3*hidden,)
 
     # Split into reset, update, new gates
-    r_x, z_x, n_x = gates_x[:hidden], gates_x[hidden:2*hidden], gates_x[2*hidden:]
-    r_h, z_h, n_h = gates_h[:hidden], gates_h[hidden:2*hidden], gates_h[2*hidden:]
+    r_x, z_x, n_x = (
+        gates_x[:hidden],
+        gates_x[hidden : 2 * hidden],
+        gates_x[2 * hidden :],
+    )
+    r_h, z_h, n_h = (
+        gates_h[:hidden],
+        gates_h[hidden : 2 * hidden],
+        gates_h[2 * hidden :],
+    )
 
-    r = _sigmoid(r_x + r_h)        # reset gate
-    z = _sigmoid(z_x + z_h)        # update gate
-    n = np.tanh(n_x + r * n_h)     # new gate
+    r = _sigmoid(r_x + r_h)  # reset gate
+    z = _sigmoid(z_x + z_h)  # update gate
+    n = np.tanh(n_x + r * n_h)  # new gate
 
     h_new = (1.0 - z) * n + z * h_prev
     return h_new.astype(np.float32, copy=False)
@@ -620,11 +640,48 @@ def _bigru_forward(
     seq: np.ndarray,
     weights: dict[str, np.ndarray],
 ) -> np.ndarray:
-    """Run BiGRU over a sequence.
+    """Run multi-layer BiGRU over a sequence.
+
+    Supports both 1-layer (v3) and multi-layer (v4) BiGRU.
+    For multi-layer, each layer takes the concatenated forward+backward
+    output of the previous layer as input.
 
     Args:
         seq: Input sequence, shape (T, input_dim).
         weights: Model weights dict (must contain rnn.* keys).
+
+    Returns:
+        Output sequence, shape (T, 2*hidden).
+    """
+    # Determine number of layers by checking which layer keys exist
+    num_layers = 0
+    while (
+        f"rnn.weight_ih_l{num_layers}" in weights
+        or f"rnn.weight_ih_l{num_layers}_T" in weights
+    ):
+        num_layers += 1
+    if num_layers == 0:
+        raise ValueError("No GRU layer weights found")
+
+    current_input = seq  # (T, input_dim)
+
+    for layer in range(num_layers):
+        current_input = _bigru_single_layer(current_input, weights, layer)
+
+    return current_input  # (T, 2*hidden)
+
+
+def _bigru_single_layer(
+    seq: np.ndarray,
+    weights: dict[str, np.ndarray],
+    layer: int,
+) -> np.ndarray:
+    """Run a single BiGRU layer over a sequence.
+
+    Args:
+        seq: Input sequence, shape (T, input_dim).
+        weights: Model weights dict.
+        layer: Layer index (0, 1, ...).
 
     Returns:
         Output sequence, shape (T, 2*hidden).
@@ -638,15 +695,15 @@ def _bigru_forward(
             return weights[t_name]
         return weights[name].T
 
-    W_ih_fwd = _get_w("rnn.weight_ih_l0")
-    W_hh_fwd = _get_w("rnn.weight_hh_l0")
-    b_ih_fwd = weights["rnn.bias_ih_l0"]
-    b_hh_fwd = weights["rnn.bias_hh_l0"]
+    W_ih_fwd = _get_w(f"rnn.weight_ih_l{layer}")
+    W_hh_fwd = _get_w(f"rnn.weight_hh_l{layer}")
+    b_ih_fwd = weights[f"rnn.bias_ih_l{layer}"]
+    b_hh_fwd = weights[f"rnn.bias_hh_l{layer}"]
 
-    W_ih_bwd = _get_w("rnn.weight_ih_l0_reverse")
-    W_hh_bwd = _get_w("rnn.weight_hh_l0_reverse")
-    b_ih_bwd = weights["rnn.bias_ih_l0_reverse"]
-    b_hh_bwd = weights["rnn.bias_hh_l0_reverse"]
+    W_ih_bwd = _get_w(f"rnn.weight_ih_l{layer}_reverse")
+    W_hh_bwd = _get_w(f"rnn.weight_hh_l{layer}_reverse")
+    b_ih_bwd = weights[f"rnn.bias_ih_l{layer}_reverse"]
+    b_hh_bwd = weights[f"rnn.bias_hh_l{layer}_reverse"]
 
     hidden = b_ih_fwd.shape[0] // 3
 

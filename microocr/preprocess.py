@@ -13,7 +13,7 @@ from typing import Literal
 import numpy as np
 
 # Target height for model input (width is variable)
-TARGET_HEIGHT = 32
+TARGET_HEIGHT = 48
 
 
 def preprocess(

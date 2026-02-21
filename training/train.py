@@ -446,6 +446,8 @@ def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
     state = model.state_dict()
     result: dict[str, np.ndarray] = {}
 
+    eps = 1e-5  # PyTorch default BN epsilon
+
     for i in range(1, 5):
         conv_w = state[f"conv{i}.weight"].cpu().numpy()
         conv_b = state[f"conv{i}.bias"].cpu().numpy()
@@ -453,7 +455,6 @@ def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
         bn_beta = state[f"bn{i}.bias"].cpu().numpy()
         bn_mean = state[f"bn{i}.running_mean"].cpu().numpy()
         bn_var = state[f"bn{i}.running_var"].cpu().numpy()
-        eps = 1e-5  # PyTorch default BN epsilon
 
         scale = bn_gamma / np.sqrt(bn_var + eps)
         # Reshape scale for broadcasting: (C_out,) → (C_out, 1, 1, 1)
@@ -462,6 +463,22 @@ def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
 
         result[f"conv{i}.weight"] = w_folded.astype(np.float32)
         result[f"conv{i}.bias"] = b_folded.astype(np.float32)
+
+    # Fold BN into 1x1 projection residual conv (proj_res has no bias)
+    if "proj_res.weight" in state:
+        proj_w = state["proj_res.weight"].cpu().numpy()
+        proj_b = np.zeros(proj_w.shape[0], dtype=np.float32)  # no bias → zeros
+        bn_gamma = state["bn_proj.weight"].cpu().numpy()
+        bn_beta = state["bn_proj.bias"].cpu().numpy()
+        bn_mean = state["bn_proj.running_mean"].cpu().numpy()
+        bn_var = state["bn_proj.running_var"].cpu().numpy()
+
+        scale = bn_gamma / np.sqrt(bn_var + eps)
+        w_folded = proj_w * scale.reshape(-1, 1, 1, 1)
+        b_folded = scale * (proj_b - bn_mean) + bn_beta
+
+        result["proj_res.weight"] = w_folded.astype(np.float32)
+        result["proj_res.bias"] = b_folded.astype(np.float32)
 
     # Copy FC layers directly
     for key in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"):
@@ -494,8 +511,8 @@ def _export_npz(
     """
     arrays = fold_bn_into_conv(model)
 
-    # Architecture version marker: v3 = residual + BiGRU
-    arrays["arch_version"] = np.array([3], dtype=np.int32)
+    # Architecture version marker: v4 = proj_res + 2-layer BiGRU
+    arrays["arch_version"] = np.array([4], dtype=np.int32)
 
     if quantize_int8:
         arrays = _quantize_weights_int8(arrays)

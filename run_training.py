@@ -12,9 +12,9 @@ from training.train import train
 
 if __name__ == "__main__":
     train(
-        epochs=150,
+        epochs=200,
         batch_size=32,
-        lr=0.0008,
+        lr=0.001,
         batches_per_epoch=300,
         output_dir="output",
         seed=42,
