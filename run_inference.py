@@ -12,12 +12,14 @@ If you want to test on your own image, edit IMAGE_PATH below.
 
 import base64
 from pathlib import Path
+from typing import Literal
 
 # -- Configuration ----------------------------------------------------------
 # Set to a .png or .jpg file path to run on a real image.
 # Leave as None to auto-generate a test image.
 IMAGE_PATH = None
-WEIGHTS_PATH = "output/microocr.npz"
+NUMPY_WEIGHTS_PATH = "output/microocr.npz"
+TORCH_WEIGHTS_PATH = "output/microocr_best.pth"
 # ---------------------------------------------------------------------------
 
 
@@ -61,14 +63,148 @@ keep it simple and only focused on coverting base64 content to text toekn, we do
     return b64, text
 
 
+def _choose_backend() -> tuple[Literal["torch", "numpy"], Path, str]:
+    """Prefer CUDA torch backend when available, otherwise use NumPy."""
+    npz = Path(NUMPY_WEIGHTS_PATH)
+    pth = Path(TORCH_WEIGHTS_PATH)
+
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        if not npz.exists():
+            raise FileNotFoundError(
+                f"Neither torch backend nor NumPy weights are usable. "
+                f"Missing: {NUMPY_WEIGHTS_PATH}"
+            )
+        return "numpy", npz, "torch not installed"
+
+    import torch
+
+    if torch.cuda.is_available() and pth.exists():
+        return "torch", pth, "cuda available"
+    if torch.cuda.is_available() and not pth.exists():
+        if npz.exists():
+            return "numpy", npz, f"missing torch weights: {TORCH_WEIGHTS_PATH}"
+        raise FileNotFoundError(
+            f"CUDA is available but torch weights are missing: {TORCH_WEIGHTS_PATH}. "
+            f"NumPy fallback weights are also missing: {NUMPY_WEIGHTS_PATH}"
+        )
+    if npz.exists():
+        return "numpy", npz, "cuda not available"
+    if pth.exists():
+        # Keep the "cuda only" policy for torch backend, but provide a clear
+        # error so users can still run by exporting/using npz.
+        raise FileNotFoundError(
+            f"NumPy weights missing at {NUMPY_WEIGHTS_PATH}. "
+            f"Found torch weights at {TORCH_WEIGHTS_PATH}, but torch backend "
+            "is enabled only when CUDA is available."
+        )
+    raise FileNotFoundError(
+        f"Weights not found. Expected either {NUMPY_WEIGHTS_PATH} or {TORCH_WEIGHTS_PATH}."
+    )
+
+
+def _load_torch_model(weights: Path):
+    """Load PyTorch checkpoint onto CUDA for fast inference."""
+    import torch
+
+    from microocr.model import NUM_CLASSES, MicroOCRModel
+
+    device = torch.device("cuda")
+    model = MicroOCRModel(num_classes=NUM_CLASSES).to(device)
+    state = torch.load(str(weights), map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def _read_torch(
+    b64_string: str,
+    model,
+    *,
+    decode_mode: Literal["greedy", "beam"] = "beam",
+    beam_width: int = 12,
+    case_normalization: Literal["none", "mixed", "lower"] = "mixed",
+) -> str:
+    """Run OCR with PyTorch model forward on CUDA."""
+    import torch
+
+    from microocr.inference import _decode_line, _normalize_case_text
+    from microocr.decode import decode_base64
+    from microocr.preprocess import TARGET_HEIGHT, binarize, preprocess
+    from microocr.segment import segment_lines
+
+    gray = decode_base64(b64_string)
+    binary = binarize(gray)
+    lines = segment_lines(binary)
+
+    out_lines: list[str] = []
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        for line_img in lines:
+            processed = preprocess(
+                line_img,
+                target_height=TARGET_HEIGHT,
+                already_binary=True,
+                resize_mode="bilinear",
+            )
+            x = (
+                torch.from_numpy(processed)
+                .to(device=device, dtype=torch.float32)
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+            logits = model(x)[:, 0, :].detach().cpu().numpy()
+            text = _decode_line(
+                logits=logits,
+                decode_mode=decode_mode,
+                reject_blank=True,
+                reject_blank_ratio=0.90,
+                reject_nonblank_peak=0.55,
+                low_confidence_beam_fallback=False,
+                fallback_margin=0.05,
+                beam_width=beam_width,
+                weights=None,
+            )
+            if text:
+                out_lines.append(text)
+
+    return _normalize_case_text("\n".join(out_lines), mode=case_normalization)
+
+
+def _read_file_torch(
+    path: Path,
+    model,
+    *,
+    decode_mode: Literal["greedy", "beam"] = "beam",
+    beam_width: int = 12,
+    case_normalization: Literal["none", "mixed", "lower"] = "mixed",
+) -> str:
+    raw = path.read_bytes()
+    b64 = base64.b64encode(raw).decode("ascii")
+    return _read_torch(
+        b64,
+        model,
+        decode_mode=decode_mode,
+        beam_width=beam_width,
+        case_normalization=case_normalization,
+    )
+
+
 def main():
-    weights = Path(WEIGHTS_PATH)
-    if not weights.exists():
-        print(f"ERROR: Weights not found at '{WEIGHTS_PATH}'.")
-        print("Train the model first:  python run_training.py")
+    try:
+        backend, weights, why = _choose_backend()
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}")
+        print("Train first: python run_training.py")
         return
 
+    print(f"Backend: {backend} ({why})")
+    print(f"Weights: {weights}")
+
     import microocr
+
+    torch_model = _load_torch_model(weights) if backend == "torch" else None
 
     if IMAGE_PATH is not None:
         # Run on a real image file
@@ -78,25 +214,43 @@ def main():
             return
 
         print(f"Running inference on: {path}")
-        result = microocr.read_file(
-            str(path),
-            weights_path=str(weights),
-            decode_mode="beam",
-            beam_width=12,
-            case_normalization="mixed",
-        )
+        if backend == "torch":
+            result = _read_file_torch(
+                path,
+                torch_model,
+                decode_mode="beam",
+                beam_width=12,
+                case_normalization="mixed",
+            )
+        else:
+            result = microocr.read_file(
+                str(path),
+                weights_path=str(weights),
+                decode_mode="beam",
+                beam_width=12,
+                case_normalization="mixed",
+            )
         print(f"\nRecognized text:\n{result}")
     else:
         # Generate a test image and run
         b64, expected = generate_test_image()
         print(f"\nRunning inference...")
-        result = microocr.read(
-            b64,
-            weights_path=str(weights),
-            decode_mode="beam",
-            beam_width=12,
-            case_normalization="mixed",
-        )
+        if backend == "torch":
+            result = _read_torch(
+                b64,
+                torch_model,
+                decode_mode="beam",
+                beam_width=12,
+                case_normalization="mixed",
+            )
+        else:
+            result = microocr.read(
+                b64,
+                weights_path=str(weights),
+                decode_mode="beam",
+                beam_width=12,
+                case_normalization="mixed",
+            )
         print(f"\nRecognized text: '{result}'")
         print(f"Expected text:   '{expected}'")
         if result == expected:

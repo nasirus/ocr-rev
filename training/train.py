@@ -77,6 +77,40 @@ def collate_batch(
     )
 
 
+def _parse_eval_each_epoch_cli(raw: str) -> int | bool:
+    """Parse compatibility CLI values for --eval-each-epoch."""
+    value = raw.strip().lower()
+    if value in {"true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"false", "f", "no", "n", "off"}:
+        return False
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "eval_each_epoch must be a boolean or integer >= 1"
+        ) from exc
+
+
+def _resolve_val_every(
+    val_every: int,
+    eval_each_epoch: int | bool | None,
+) -> int:
+    """Normalize validation cadence from val_every and eval_each_epoch alias."""
+    if eval_each_epoch is None:
+        resolved = val_every
+    elif isinstance(eval_each_epoch, bool):
+        resolved = 1 if eval_each_epoch else val_every
+    elif isinstance(eval_each_epoch, int):
+        resolved = eval_each_epoch
+    else:
+        raise TypeError("eval_each_epoch must be bool, int, or None")
+
+    if resolved < 1:
+        raise ValueError("validation interval must be >= 1")
+    return resolved
+
+
 def train(
     epochs: int = 50,
     batch_size: int = 32,
@@ -95,6 +129,7 @@ def train(
     val_backend: Literal["torch", "numpy"] = "torch",
     val_batch_size: int = 128,
     val_every: int = 1,
+    eval_each_epoch: int | bool | None = None,
 ) -> None:
     """Train the MicroOCR model.
 
@@ -121,6 +156,8 @@ def train(
             exported NumPy inference parity path.
         val_batch_size: Batch size used by torch validation backend.
         val_every: Run validation every N epochs (always runs on final epoch).
+        eval_each_epoch: Compatibility alias for validation cadence. Accepts
+            bool/int and maps into ``val_every``.
     """
     if val_samples < 1:
         raise ValueError("val_samples must be >= 1")
@@ -134,8 +171,7 @@ def train(
         raise ValueError("val_backend must be 'torch' or 'numpy'")
     if val_batch_size < 1:
         raise ValueError("val_batch_size must be >= 1")
-    if val_every < 1:
-        raise ValueError("val_every must be >= 1")
+    val_every = _resolve_val_every(val_every=val_every, eval_each_epoch=eval_each_epoch)
 
     rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -563,6 +599,16 @@ def main():
         help="Run validation every N epochs (always runs on final epoch).",
     )
     parser.add_argument(
+        "--eval-each-epoch",
+        "--eval_each_epoch",
+        nargs="?",
+        const="true",
+        type=_parse_eval_each_epoch_cli,
+        default=None,
+        help="Compatibility alias for validation cadence. "
+        "Accepts true/false or integer N (same as --val-every N).",
+    )
+    parser.add_argument(
         "--curriculum",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -595,6 +641,7 @@ def main():
         val_backend=args.val_backend,
         val_batch_size=args.val_batch_size,
         val_every=args.val_every,
+        eval_each_epoch=args.eval_each_epoch,
     )
 
 
