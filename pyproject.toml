@@ -22,5 +22,15 @@ dev = [
     "pillow>=9.0",
 ]
 
+[dependency-groups]
+train = [
+    "torch>=2.0",
+    "pillow>=9.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pillow>=9.0",
+]
+
 [tool.setuptools]
 packages = ["microocr", "training"]
