@@ -15,15 +15,22 @@ import argparse
 import shutil
 import time
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from microocr.model import BLANK_IDX, NUM_CLASSES, MicroOCRModel, char_to_index
+from microocr.model import (
+    BLANK_IDX,
+    NUM_CLASSES,
+    MicroOCRModel,
+    char_to_index,
+    index_to_char,
+)
 from microocr.preprocess import TARGET_HEIGHT
-from training.eval import build_eval_set, evaluate_arrays
+from training.eval import build_eval_set, edit_distance, evaluate_arrays
 from training.synth_data import generate_batch
 
 
@@ -85,6 +92,9 @@ def train(
     val_max_len: int = 120,
     curriculum: bool = True,
     entropy_weight: float = 0.0,
+    val_backend: Literal["torch", "numpy"] = "torch",
+    val_batch_size: int = 128,
+    val_every: int = 1,
 ) -> None:
     """Train the MicroOCR model.
 
@@ -106,6 +116,11 @@ def train(
             font-size range over epochs.
         entropy_weight: Optional entropy regularization weight. Keep at
             0.0 for best exact-transcription accuracy on this task.
+        val_backend: Validation backend. ``"torch"`` is much faster and runs
+            model forward directly in PyTorch; ``"numpy"`` validates through
+            exported NumPy inference parity path.
+        val_batch_size: Batch size used by torch validation backend.
+        val_every: Run validation every N epochs (always runs on final epoch).
     """
     if val_samples < 1:
         raise ValueError("val_samples must be >= 1")
@@ -115,6 +130,12 @@ def train(
         raise ValueError("train_max_len must be >= train_min_len")
     if val_max_len < val_min_len:
         raise ValueError("val_max_len must be >= val_min_len")
+    if val_backend not in ("torch", "numpy"):
+        raise ValueError("val_backend must be 'torch' or 'numpy'")
+    if val_batch_size < 1:
+        raise ValueError("val_batch_size must be >= 1")
+    if val_every < 1:
+        raise ValueError("val_every must be >= 1")
 
     rng = np.random.default_rng(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -150,6 +171,10 @@ def train(
     print(
         f"Validation set: {val_samples} synthetic samples (seed={val_seed}, "
         f"len={val_min_len}-{val_max_len})"
+    )
+    print(
+        "Validation config: "
+        f"backend={val_backend}, batch_size={val_batch_size}, every={val_every} epoch(s)"
     )
 
     best_val_cer = float("inf")
@@ -239,22 +264,40 @@ def train(
             f"lr={optimizer.param_groups[0]['lr']:.6f}"
         )
 
-        model.eval()
-        val = _evaluate_model(model, eval_images, eval_labels)
-        val_cer = val["cer"]
-        val_word_acc = val["word_acc"]
-        print(f"  val_cer={val_cer:.4f}  val_word_acc={val_word_acc:.4f}")
-
-        # Save best model
-        if val_cer < best_val_cer:
-            best_val_cer = val_cer
-            best_val_word_acc = val_word_acc
-            _save_model(model, out_path / "microocr_best.pth")
-            _export_npz(model, out_path / "microocr.npz")
+        should_validate = (epoch % val_every == 0) or (epoch == epochs)
+        if should_validate:
+            model.eval()
+            val_start = time.time()
+            if val_backend == "torch":
+                val = _evaluate_model_torch(
+                    model,
+                    eval_images,
+                    eval_labels,
+                    device=device,
+                    batch_size=val_batch_size,
+                )
+            else:
+                val = _evaluate_model_numpy(model, eval_images, eval_labels)
+            val_elapsed = time.time() - val_start
+            val_cer = val["cer"]
+            val_word_acc = val["word_acc"]
             print(
-                "  -> Saved best model "
-                f"(cer={best_val_cer:.4f}, word_acc={best_val_word_acc:.4f})"
+                f"  val_cer={val_cer:.4f}  val_word_acc={val_word_acc:.4f} "
+                f"(val_time={val_elapsed:.1f}s, backend={val_backend})"
             )
+
+            # Save best model
+            if val_cer < best_val_cer:
+                best_val_cer = val_cer
+                best_val_word_acc = val_word_acc
+                _save_model(model, out_path / "microocr_best.pth")
+                _export_npz(model, out_path / "microocr.npz")
+                print(
+                    "  -> Saved best model "
+                    f"(cer={best_val_cer:.4f}, word_acc={best_val_word_acc:.4f})"
+                )
+        else:
+            print(f"  validation skipped (val_every={val_every})")
 
         # Save periodic checkpoint
         if epoch % 10 == 0:
@@ -277,7 +320,7 @@ def train(
     print(f"  Copied to: {weights_dir / 'microocr.npz'}")
 
 
-def _evaluate_model(
+def _evaluate_model_numpy(
     model: MicroOCRModel,
     images: list[np.ndarray],
     labels: list[str],
@@ -285,6 +328,72 @@ def _evaluate_model(
     """Evaluate current model weights with NumPy inference (BN-folded)."""
     weights = fold_bn_into_conv(model)
     return evaluate_arrays(weights, images, labels)
+
+
+def _ctc_greedy_decode_path(path: np.ndarray) -> str:
+    """Collapse repeats/blanks from a greedy CTC argmax path."""
+    out: list[str] = []
+    prev = BLANK_IDX
+    for idx in path:
+        cur = int(idx)
+        if cur != BLANK_IDX and cur != prev:
+            out.append(index_to_char(cur))
+        prev = cur
+    return "".join(out)
+
+
+@torch.no_grad()
+def _evaluate_model_torch(
+    model: MicroOCRModel,
+    images: list[np.ndarray],
+    labels: list[str],
+    *,
+    device: torch.device,
+    batch_size: int = 128,
+) -> dict[str, float]:
+    """Evaluate with batched PyTorch forward + greedy CTC decode."""
+    if not images:
+        raise ValueError("images must be non-empty")
+    if len(images) != len(labels):
+        raise ValueError("images and labels must have the same length")
+
+    total_chars = 0
+    char_errors = 0
+    exact = 0
+
+    for start in range(0, len(images), batch_size):
+        end = min(start + batch_size, len(images))
+        batch_images = images[start:end]
+        batch_labels = labels[start:end]
+
+        max_w = max(img.shape[1] for img in batch_images)
+        # Use zero right-padding to better match single-sample convolution
+        # boundary behavior from the NumPy evaluator.
+        batch = np.zeros((len(batch_images), 1, TARGET_HEIGHT, max_w), dtype=np.float32)
+        valid_steps = [img.shape[1] // 4 for img in batch_images]
+        for i, img in enumerate(batch_images):
+            w = img.shape[1]
+            batch[i, 0, :, :w] = img
+
+        batch_tensor = torch.from_numpy(batch).to(device)
+        logits = model(batch_tensor)  # (T, B, C)
+        paths = torch.argmax(logits, dim=2).permute(1, 0).cpu().numpy()  # (B, T)
+
+        for path, label, t_steps in zip(
+            paths,
+            batch_labels,
+            valid_steps,
+            strict=True,
+        ):
+            pred = _ctc_greedy_decode_path(path[:t_steps])
+            char_errors += edit_distance(label, pred)
+            total_chars += len(label)
+            if pred == label:
+                exact += 1
+
+    cer = char_errors / max(total_chars, 1)
+    word_acc = exact / len(labels)
+    return {"cer": float(cer), "word_acc": float(word_acc)}
 
 
 def fold_bn_into_conv(model: MicroOCRModel) -> dict[str, np.ndarray]:
@@ -435,6 +544,25 @@ def main():
         "--val-max-len", type=int, default=120, help="Validation max label length"
     )
     parser.add_argument(
+        "--val-backend",
+        type=str,
+        choices=("torch", "numpy"),
+        default="torch",
+        help="Validation backend: torch (fast) or numpy (parity check).",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=128,
+        help="Batch size used by torch validation backend.",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=50,
+        help="Run validation every N epochs (always runs on final epoch).",
+    )
+    parser.add_argument(
         "--curriculum",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -464,6 +592,9 @@ def main():
         val_max_len=args.val_max_len,
         curriculum=args.curriculum,
         entropy_weight=args.entropy_weight,
+        val_backend=args.val_backend,
+        val_batch_size=args.val_batch_size,
+        val_every=args.val_every,
     )
 
 
