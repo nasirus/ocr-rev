@@ -28,10 +28,19 @@ def generate_test_image() -> tuple[str, str]:
     from PIL import Image, ImageDraw, ImageFont
 
     text = """
-    if we need to build a new ocr from scratch, i mean let's forget all the actual technic of converting image to text.
-the main idea is to start from a base64 content from image contening a text and convert it to token.
-be creative and let's brainstomre how can we build a new framework in python to be efficient , capacle to run in constrained hardware liike phone or web browser.
-keep it simple and only focused on coverting base64 content to text toekn, we dont need to have an llm that understand or interpret just converting image to text as OCR
+                                        ABSTRACT
+We present the results of the Exploration of Local VolumE Survey - Field (ELVES-Field), a survey of
+the dwarf galaxies in the Local Volume (LV; D < 10 Mpc) over roughly 3, 000 square degrees, focusing
+on the field dwarf population. Candidates are detected using a semi-automated algorithm tailored
+for low surface brightness dwarfs. Using tests with injected galaxies, we show the detection is 50%
+complete to mg ∼ 20 mag and M⋆ ∼ 106 M⊙. Candidates are confirmed to be true nearby dwarfs
+through distance measurements including redshift, tip of the red giant branch, and surface brightness
+fluctuations. We identify isolated, field dwarfs using various environmental criteria. Over the survey
+footprint, we detect and confirm 95 LV dwarfs, 44 of which we consider isolated. Using this sample,
+we infer the field dwarf mass function and find good agreement at the high-mass end with previous
+redshift surveys and with the predictions of the IllustrisTNG simulation. This sample of isolated, field
+dwarfs represents a powerful dataset to investigate aspects of small-scale structure and the effect of
+environment on dwarf galaxy evolution.
     """
 
     # Render

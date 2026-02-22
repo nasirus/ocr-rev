@@ -15,6 +15,7 @@ Enhanced to produce realistic document-like text patterns including:
 from __future__ import annotations
 
 import os
+import re
 import string
 import sys
 from pathlib import Path
@@ -155,6 +156,7 @@ _PHRASE_WORDS = [
 
 _SEPARATORS = [" ", "-", "_", "/", "."]
 _TAIL_PUNCT = ["", "!", "?", ":", ";", "."]
+_NONSPACE_SEPARATORS = [sep for sep in _SEPARATORS if sep != " "]
 _CONNECTOR_WORDS = [
     "and",
     "or",
@@ -181,8 +183,23 @@ _CONNECTOR_WORDS = [
     "you",
     "they",
     "it",
-    "lets",
-    "dont",
+    "let's",
+    "don't",
+]
+
+_CONTRACTIONS = [
+    "don't",
+    "let's",
+    "it's",
+    "we're",
+    "can't",
+    "i'm",
+    "you're",
+    "they're",
+    "won't",
+    "that's",
+    "there's",
+    "isn't",
 ]
 
 # ── Realistic document data pools ──────────────────────────────────────
@@ -686,6 +703,62 @@ _FIELD_LABELS = [
 ]
 
 
+def _sample_separator(
+    rng: np.random.Generator,
+    *,
+    allow_space: bool = True,
+) -> str:
+    """Sample a separator token used across mixed-text generators."""
+    if allow_space:
+        return str(rng.choice(_SEPARATORS))
+    return str(rng.choice(_NONSPACE_SEPARATORS))
+
+
+def _join_with_separators(
+    tokens: list[str],
+    rng: np.random.Generator,
+    *,
+    mostly_spaces: bool = True,
+) -> str:
+    """Join tokens with occasional sampled separators."""
+    if not tokens:
+        return ""
+
+    out = [tokens[0]]
+    for token in tokens[1:]:
+        if mostly_spaces and rng.random() < 0.75:
+            sep = " "
+        else:
+            sep = _sample_separator(rng, allow_space=mostly_spaces)
+        out.append(sep)
+        out.append(token)
+    return "".join(out)
+
+
+def _apply_tail_punct(
+    text: str,
+    rng: np.random.Generator,
+    *,
+    add_prob: float = 0.35,
+    replace_prob: float = 0.30,
+) -> str:
+    """Append or replace trailing punctuation using configured options."""
+    stripped = text.rstrip()
+    if not stripped:
+        return text
+
+    has_tail = stripped[-1] in "!?;:."
+    if has_tail and rng.random() < replace_prob:
+        stripped = stripped.rstrip("!?;:.")
+        has_tail = False
+
+    if not has_tail and rng.random() < add_prob:
+        tail = str(rng.choice(_TAIL_PUNCT))
+        if tail:
+            stripped = stripped + tail
+    return stripped
+
+
 def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
     """Generate diverse text patterns reflecting real documents.
 
@@ -708,22 +781,28 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
     """
     choice = rng.random()
 
-    if choice < 0.08:
+    if choice < 0.06:
         # Standard random alphanumeric
-        length = int(rng.integers(min_len, max_len + 1))
+        length = _sample_length(rng, min_len=min_len, max_len=max_len)
         text = "".join(str(rng.choice(_ALNUM_CHARS)) for _ in range(length))
         return _fit_text_length(text, rng, min_len, max_len)
 
-    if choice < 0.13:
+    if choice < 0.10:
         # CamelCase words
         word = str(rng.choice(_CAMEL_WORDS))
         if rng.random() < 0.3:
             word = word + str(int(rng.integers(0, 100)))
         return _fit_text_length(word, rng, min_len, max_len)
 
-    if choice < 0.18:
+    if choice < 0.14:
         # Alphanumeric codes (e.g., AB12cd, X7y9Z)
-        length = int(rng.integers(max(min_len, 4), min(max_len + 1, 16)))
+        length = _sample_length(
+            rng,
+            min_len=min_len,
+            max_len=max_len,
+            floor=4,
+            ceil=15,
+        )
         code = []
         for _ in range(length):
             pool_choice = rng.random()
@@ -735,52 +814,79 @@ def _generate_text(rng: np.random.Generator, min_len: int, max_len: int) -> str:
                 code.append(str(rng.choice(list(string.ascii_lowercase))))
         return _fit_text_length("".join(code), rng, min_len, max_len)
 
-    if choice < 0.23:
+    if choice < 0.18:
         return _fit_text_length(_gen_date(rng, max_len), rng, min_len, max_len)
-    if choice < 0.28:
+    if choice < 0.22:
         return _fit_text_length(_gen_email(rng, max_len), rng, min_len, max_len)
-    if choice < 0.32:
+    if choice < 0.25:
         return _fit_text_length(_gen_url_or_path(rng, max_len), rng, min_len, max_len)
-    if choice < 0.36:
+    if choice < 0.28:
         return _fit_text_length(_gen_address(rng, max_len), rng, min_len, max_len)
-    if choice < 0.40:
+    if choice < 0.31:
         return _fit_text_length(_gen_phone(rng, max_len), rng, min_len, max_len)
-    if choice < 0.46:
+    if choice < 0.36:
         return _fit_text_length(_gen_currency(rng, max_len), rng, min_len, max_len)
-    if choice < 0.51:
+    if choice < 0.40:
         return _fit_text_length(
             _gen_reference_number(rng, max_len), rng, min_len, max_len
         )
+    if choice < 0.52:
+        sentence = _inject_contractions(_gen_sentence(rng, max_len), rng)
+        return _fit_text_length(sentence, rng, min_len, max_len)
     if choice < 0.60:
-        return _fit_text_length(_gen_sentence(rng, max_len), rng, min_len, max_len)
-    if choice < 0.67:
         return _fit_text_length(_gen_key_value(rng, max_len), rng, min_len, max_len)
-    if choice < 0.72:
+    if choice < 0.66:
         return _fit_text_length(_gen_measurement(rng, max_len), rng, min_len, max_len)
-    if choice < 0.78:
+    if choice < 0.72:
         return _fit_text_length(_gen_full_name(rng, max_len), rng, min_len, max_len)
-    if choice < 0.82:
+    if choice < 0.86:
         # Paragraph-like fragments to better match long-form OCR inputs.
         return _gen_paragraph_fragment(rng, min_len=min_len, max_len=max_len)
-    if choice < 0.96:
+    if choice < 0.98:
         # Confusion-pair enriched text for commonly confused characters
         return _gen_confusion_pair_text(rng, min_len=min_len, max_len=max_len)
 
     # Rare/special boosted strings
-    length = int(rng.integers(min_len, max_len + 1))
+    length = _sample_length(rng, min_len=min_len, max_len=max_len)
     text = []
     for _ in range(length):
         p = rng.random()
-        if p < 0.35:
+        if p < 0.30:
             text.append(str(rng.choice(_RARE_CHARS)))
-        elif p < 0.65 and _SPECIAL_CHARS:
+        elif p < 0.56 and _SPECIAL_CHARS:
             text.append(str(rng.choice(_SPECIAL_CHARS)))
-        elif p < 0.75:
+        elif p < 0.79:
             text.append(_SPACE_CHAR)
         else:
             text.append(str(rng.choice(_COMMON_CHARS)))
     out = "".join(text).strip()
     return _fit_text_length(out or "0", rng, min_len, max_len)
+
+
+def _sample_length(
+    rng: np.random.Generator,
+    *,
+    min_len: int,
+    max_len: int,
+    floor: int | None = None,
+    ceil: int | None = None,
+) -> int:
+    """Sample an inclusive random length robustly for constrained ranges."""
+    lo = min_len
+    hi = max_len
+    if floor is not None:
+        lo = max(lo, floor)
+    if ceil is not None:
+        hi = min(hi, ceil)
+
+    # When constraints collapse (e.g., min_len >= 16 with ceil=15),
+    # fall back to the caller-requested bounds instead of crashing.
+    if hi < lo:
+        lo = min_len
+        hi = max_len
+    if hi < lo:
+        return lo
+    return int(rng.integers(lo, hi + 1))
 
 
 def _fit_text_length(
@@ -791,7 +897,9 @@ def _fit_text_length(
 ) -> str:
     """Normalize generated text to requested length bounds."""
     filtered = "".join(c for c in text if c in CHARS)
-    filtered = " ".join(filtered.split())
+    filtered = filtered.replace("\t", " ").replace("\n", " ")
+    filtered = re.sub(r" {3,}", "  ", filtered)
+    filtered = filtered.strip()
     if not filtered:
         filtered = str(rng.choice(_PHRASE_WORDS))
 
@@ -804,6 +912,18 @@ def _fit_text_length(
         else:
             break
     return filtered[:max_len].strip() or "text"
+
+
+def _inject_contractions(text: str, rng: np.random.Generator) -> str:
+    """Inject apostrophe-heavy tokens to train punctuation retention."""
+    out = text
+    if rng.random() < 0.35:
+        out = out + " " + str(rng.choice(_CONTRACTIONS))
+    if rng.random() < 0.20:
+        out = str(rng.choice(_CONTRACTIONS)) + " " + out
+    if rng.random() < 0.10:
+        out = out.replace(" ", "  ", 1)
+    return out
 
 
 def _gen_paragraph_fragment(
@@ -825,10 +945,12 @@ def _gen_paragraph_fragment(
 
     while len(" ".join(parts)) < target:
         p = rng.random()
-        if p < 0.68:
+        if p < 0.58:
             token = str(rng.choice(_PHRASE_WORDS))
-        elif p < 0.88:
+        elif p < 0.78:
             token = str(rng.choice(_CONNECTOR_WORDS))
+        elif p < 0.90:
+            token = str(rng.choice(_CONTRACTIONS))
         else:
             token = str(rng.choice(_CAMEL_WORDS)).lower()
 
@@ -840,11 +962,11 @@ def _gen_paragraph_fragment(
         comma_idx = int(rng.integers(2, len(parts) - 1))
         parts[comma_idx] = parts[comma_idx] + ","
 
-    text = " ".join(parts)
-    if rng.random() < 0.45:
-        text = text + "."
-    elif rng.random() < 0.12:
-        text = text + "?"
+    text = _join_with_separators(parts, rng, mostly_spaces=True)
+    text = _apply_tail_punct(text, rng, add_prob=0.55, replace_prob=0.25)
+
+    if rng.random() < 0.18:
+        text = text.replace(" ", "  ", 1)
 
     if rng.random() < 0.35 and text:
         text = text[0].upper() + text[1:]
@@ -1044,7 +1166,8 @@ def _gen_reference_number(rng: np.random.Generator, max_len: int) -> str:
     style = int(rng.integers(0, 5))
     if style == 0:
         num = int(rng.integers(1000, 999999))
-        text = f"{prefix}-{num}"
+        sep = _sample_separator(rng, allow_space=False)
+        text = f"{prefix}{sep}{num}"
     elif style == 1:
         num = int(rng.integers(100000, 9999999))
         text = f"{prefix}{num}"
@@ -1052,7 +1175,8 @@ def _gen_reference_number(rng: np.random.Generator, max_len: int) -> str:
         # With date component
         yy = int(rng.integers(20, 27))
         seq = int(rng.integers(1, 9999))
-        text = f"{prefix}-{yy}-{seq:04d}"
+        sep = _sample_separator(rng, allow_space=False)
+        text = f"{prefix}{sep}{yy}{sep}{seq:04d}"
     elif style == 3:
         # Alphanumeric
         length = int(rng.integers(6, 12))
@@ -1060,11 +1184,13 @@ def _gen_reference_number(rng: np.random.Generator, max_len: int) -> str:
             str(rng.choice(list(string.ascii_uppercase + string.digits)))
             for _ in range(length)
         )
-        text = f"{prefix}-{chars}"
+        sep = _sample_separator(rng, allow_space=False)
+        text = f"{prefix}{sep}{chars}"
     else:
         num = int(rng.integers(1, 99999))
         text = f"#{num:05d}"
 
+    text = _apply_tail_punct(text, rng, add_prob=0.18, replace_prob=0.15)
     return text[:max_len]
 
 
@@ -1077,7 +1203,7 @@ def _gen_sentence(rng: np.random.Generator, max_len: int) -> str:
         noun = str(rng.choice(_NOUNS))
         verb = str(rng.choice(_VERBS))
         adj = str(rng.choice(_ADJECTIVES))
-        text = f"The {noun} {verb} {adj}."
+        text = f"The {noun} {verb} {adj}"
     elif style == 1:
         # Action sentence
         noun = str(rng.choice(_NOUNS))
@@ -1089,18 +1215,18 @@ def _gen_sentence(rng: np.random.Generator, max_len: int) -> str:
         noun = str(rng.choice(_NOUNS))
         verb = str(rng.choice(_VERBS))
         adv = str(rng.choice(_ADVERBS))
-        text = f"The {noun} {adv} {verb}."
+        text = f"The {noun} {adv} {verb}"
     elif style == 3:
         # Question
         noun = str(rng.choice(_NOUNS))
         verb = str(rng.choice(_VERBS))
         adj = str(rng.choice(_ADJECTIVES))
-        text = f"Is the {noun} {adj}?"
+        text = f"Is the {noun} {adj}"
     elif style == 4:
         # Imperative
         verb = str(rng.choice(_VERBS))
         noun = str(rng.choice(_NOUNS))
-        text = f"Please {verb} the {noun}."
+        text = f"Please {verb} the {noun}"
     elif style == 5:
         # Error/status message
         noun = str(rng.choice(_NOUNS))
@@ -1112,7 +1238,15 @@ def _gen_sentence(rng: np.random.Generator, max_len: int) -> str:
         verb1 = str(rng.choice(_VERBS))
         noun2 = str(rng.choice(_NOUNS))
         verb2 = str(rng.choice(_VERBS))
-        text = f"The {noun1} {verb1} and {noun2} {verb2}"
+        text = _join_with_separators(
+            ["The", noun1, verb1, "and", noun2, verb2],
+            rng,
+            mostly_spaces=True,
+        )
+
+    if " " in text and rng.random() < 0.30:
+        text = _join_with_separators(text.split(" "), rng, mostly_spaces=True)
+    text = _apply_tail_punct(text, rng, add_prob=0.65, replace_prob=0.35)
 
     text = "".join(c for c in text if c in CHARS)
     if len(text) > max_len:
@@ -1151,6 +1285,15 @@ def _gen_key_value(rng: np.random.Generator, max_len: int) -> str:
         # Bracketed
         val = str(rng.choice(_PHRASE_WORDS))
         text = f"{label} [{val}]"
+
+    if rng.random() < 0.40:
+        sep = _sample_separator(rng, allow_space=True)
+        split_idx = text.find(": ")
+        if split_idx != -1:
+            text = text[:split_idx] + sep + text[split_idx + 2 :]
+        elif " = " in text:
+            text = text.replace(" = ", sep, 1)
+    text = _apply_tail_punct(text, rng, add_prob=0.25, replace_prob=0.15)
 
     text = "".join(c for c in text if c in CHARS)
     return text[:max_len]
@@ -1293,6 +1436,7 @@ def generate_sample(
     target_height: int = TARGET_HEIGHT,
     apply_augment: bool = True,
     align_with_inference: bool = True,
+    hard_example_prob: float = 0.0,
 ) -> tuple[np.ndarray, str]:
     """Generate a single synthetic (image, label) pair.
 
@@ -1305,6 +1449,8 @@ def generate_sample(
         apply_augment: Whether to apply data augmentation.
         align_with_inference: If True, run the same crop/resize pipeline
             as runtime inference.
+        hard_example_prob: Probability of sampling a hard text pattern
+            (long paragraph/confusion-heavy/apostrophe-rich).
 
     Returns:
         Tuple of:
@@ -1314,8 +1460,23 @@ def generate_sample(
     if rng is None:
         rng = np.random.default_rng()
 
-    # Generate diverse text
-    label = _generate_text(rng, min_len, max_len)
+    # Generate text, with optional hard-example oversampling.
+    if hard_example_prob > 0.0 and rng.random() < hard_example_prob:
+        hard_min = max(min_len, min(max_len, max(8, int(max_len * 0.65))))
+        style = rng.random()
+        if style < 0.45:
+            label = _gen_confusion_pair_text(rng, min_len=hard_min, max_len=max_len)
+        elif style < 0.80:
+            label = _gen_paragraph_fragment(rng, min_len=hard_min, max_len=max_len)
+        else:
+            label = _fit_text_length(
+                _inject_contractions(_gen_sentence(rng, max_len), rng),
+                rng,
+                min_len=hard_min,
+                max_len=max_len,
+            )
+    else:
+        label = _generate_text(rng, min_len, max_len)
 
     # Keep long labels readable by biasing to smaller fonts for long strings.
     font_size = _sample_font_size_for_label(
